@@ -48,7 +48,7 @@ def add_to_recent(filepath):
 
 class KompasExportApp:
 
-    VERSION = "1.3.0"
+    VERSION = "1.4.0"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -61,13 +61,18 @@ class KompasExportApp:
             self.root = tk.Tk()
             self._dnd_available = False
         self.root.title(f"{self.APP_NAME} v{self.VERSION}")
-        self.root.geometry("620x310")
+        self.root.geometry("620x340")
         self.root.resizable(False, True)
 
         self.show_recent = tk.BooleanVar(value=False)
         self.show_log = tk.BooleanVar(value=False)
+        self.export_excel = tk.BooleanVar(value=True)
+        self.export_word = tk.BooleanVar(value=True)
+        self.export_pdf = tk.BooleanVar(value=True)
+        self.export_costs = tk.BooleanVar(value=False)
         self._spinner_running = False
         self._spinner_cycle = itertools.cycle(SPINNER_FRAMES)
+        self._current_template = None
 
         self._setup_menu()
         self._setup_ui()
@@ -89,6 +94,9 @@ class KompasExportApp:
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Ввести лицензию", command=self._show_license_dialog)
         settings_menu.add_command(label="Мой ID компьютера", command=self._show_machine_id)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Шаблоны...", command=self._show_template_dialog)
+        settings_menu.add_command(label="Цены и калькулятор...", command=self._show_prices_dialog)
         settings_menu.add_separator()
         settings_menu.add_command(label="Выход", command=self.root.quit)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
@@ -131,13 +139,23 @@ class KompasExportApp:
             ttk.Label(file_frame, text="или перетащите .a3d файл в окно",
                       font=("Arial", 8), foreground="gray").pack(anchor="w", pady=(5, 0))
 
+        # --- Форматы экспорта ---
+        fmt_frame = ttk.Frame(self.root)
+        fmt_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
+
+        ttk.Label(fmt_frame, text="Форматы:", font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(fmt_frame, text="Excel", variable=self.export_excel).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(fmt_frame, text="Word", variable=self.export_word).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(fmt_frame, text="PDF", variable=self.export_pdf).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(fmt_frame, text="Стоимость", variable=self.export_costs).pack(side=tk.LEFT, padx=8)
+
         # --- Кнопка ЭКСПОРТ + Спиннер ---
         action_frame = ttk.Frame(self.root)
         action_frame.pack(pady=8)
 
         self.export_btn = tk.Button(
             action_frame,
-            text="  ЭКСПОРТ В EXCEL / WORD  ",
+            text="  ЭКСПОРТ  ",
             command=self._export,
             font=("Arial", 11, "bold"),
             bg="#2F5496",
@@ -199,7 +217,7 @@ class KompasExportApp:
         messagebox.showinfo("О программе",
             f"{self.APP_NAME} v{self.VERSION}\n\n"
             "Экспорт сводной ведомости из КОМПАС-3D v24\n"
-            "в форматы Excel и Word.\n\n"
+            "в форматы Excel, Word и PDF.\n\n"
             "GitHub: github.com/Djonros/Svodnik")
 
     def _setup_dragdrop(self):
@@ -322,18 +340,36 @@ class KompasExportApp:
             messagebox.showerror("Ошибка", "Файл не найден!")
             return
 
+        formats = set()
+        if self.export_excel.get():
+            formats.add("excel")
+        if self.export_word.get():
+            formats.add("word")
+        if self.export_pdf.get():
+            formats.add("pdf")
+        if not formats:
+            messagebox.showwarning("Внимание", "Выберите хотя бы один формат!")
+            return
+
         self.export_btn.config(state="disabled")
         self._start_spinner()
-        self._log("Начало экспорта...")
+        fmt_list = ", ".join(sorted(formats)).upper()
+        self._log(f"Начало экспорта ({fmt_list})...")
 
         try:
-            exporter = KompasExportFinal()
+            exporter = KompasExportFinal(template=self._current_template)
 
             import io
             old_stdout = sys.stdout
             sys.stdout = io.StringIO()
 
-            exporter.run(filepath)
+            if self.export_costs.get():
+                exporter.run(filepath, formats=formats)
+                exporter.calculate_costs()
+                if "excel" in formats:
+                    exporter.generate_excel()
+            else:
+                exporter.run(filepath, formats=formats)
 
             output = sys.stdout.getvalue()
             sys.stdout = old_stdout
@@ -408,6 +444,207 @@ class KompasExportApp:
                 messagebox.showerror("Ошибка", "Неверный ключ лицензии!")
 
         ttk.Button(dialog, text="Активировать", command=activate).pack(pady=15)
+
+    def _show_template_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Шаблоны")
+        dialog.geometry("550x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Шаблоны экспорта:", font=("Arial", 10)).pack(pady=(15, 5))
+
+        user_tmpl_dir = os.path.join(os.path.expanduser("~"), ".svodnik_templates")
+        os.makedirs(user_tmpl_dir, exist_ok=True)
+
+        app_dir = os.path.dirname(__file__)
+        templates = {}
+
+        for d in [app_dir, user_tmpl_dir]:
+            if not os.path.exists(d):
+                continue
+            for f in os.listdir(d):
+                if f.startswith("template_") and f.endswith(".json"):
+                    path = os.path.join(d, f)
+                    try:
+                        import json
+                        with open(path, "r", encoding="utf-8") as fh:
+                            tmpl = json.load(fh)
+                        name = tmpl.get("name", f)
+                        templates[name] = {"path": path, "data": tmpl, "user": d == user_tmpl_dir}
+                    except:
+                        pass
+
+        listbox = tk.Listbox(dialog, font=("Consolas", 10))
+        listbox.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+
+        for name in templates:
+            label = f"{name}" + (" [ваш]" if templates[name]["user"] else " [системный]")
+            listbox.insert(tk.END, label)
+
+        self._template_names = list(templates.keys())
+
+        def apply_template():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            name = self._template_names[sel[0]]
+            self._current_template = templates[name]["data"]
+            self._log(f"Шаблон: {name}")
+            dialog.destroy()
+
+        def create_template():
+            self._edit_template_dialog(None, user_tmpl_dir, dialog)
+
+        def edit_template():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            name = self._template_names[sel[0]]
+            tmpl = templates[name]
+            if not tmpl["user"]:
+                messagebox.showwarning("Внимание", "Системные шаблоны нельзя редактировать.\nСоздайте копию.")
+                return
+            self._edit_template_dialog(tmpl["data"], user_tmpl_dir, dialog)
+
+        def delete_template():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            name = self._template_names[sel[0]]
+            tmpl = templates[name]
+            if not tmpl["user"]:
+                messagebox.showwarning("Внимание", "Системные шаблоны нельзя удалять.")
+                return
+            if messagebox.askyesno("Удаление", f"Удалить шаблон '{name}'?"):
+                try:
+                    os.remove(tmpl["path"])
+                    self._log(f"Шаблон удалён: {name}")
+                    dialog.destroy()
+                    self._show_template_dialog()
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось удалить:\n{e}")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Применить", command=apply_template).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="Создать", command=create_template).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="Редактировать", command=edit_template).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="Удалить", command=delete_template).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="Закрыть", command=dialog.destroy).pack(side=tk.LEFT, padx=3)
+
+    def _edit_template_dialog(self, existing_data, save_dir, parent_dialog):
+        import json
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Редактор шаблона")
+        dialog.geometry("600x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Шаблон:", font=("Arial", 10)).pack(pady=(10, 5))
+
+        text = tk.Text(dialog, font=("Consolas", 9), width=70, height=25)
+        text.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        if existing_data:
+            text.insert("1.0", json.dumps(existing_data, ensure_ascii=False, indent=2))
+        else:
+            default = {
+                "name": "Новый шаблон",
+                "excel": {
+                    "title": "СВОДНАЯ ВЕДОМОСТЬ",
+                    "columns": [
+                        {"key": "position", "header": "Позиция", "width": 8},
+                        {"key": "marking", "header": "Обозначение", "width": 25},
+                        {"key": "name", "header": "Наименование", "width": 40},
+                        {"key": "quantity", "header": "Кол-во", "width": 12},
+                        {"key": "mass_kg", "header": "Масса, кг", "width": 12},
+                        {"key": "material", "header": "Материал", "width": 25},
+                        {"key": "bending", "header": "Гибка", "width": 8}
+                    ],
+                    "header_color": "2F5496",
+                    "assembly_color": "D6E4F0"
+                },
+                "word": {
+                    "title": "СВОДНАЯ ВЕДОМОСТЬ",
+                    "columns": [
+                        {"key": "position", "header": "Поз."},
+                        {"key": "marking", "header": "Обозначение"},
+                        {"key": "name", "header": "Наименование"},
+                        {"key": "quantity", "header": "Кол-во"},
+                        {"key": "mass_kg", "header": "Масса, кг"},
+                        {"key": "material", "header": "Материал"},
+                        {"key": "bending", "header": "Гибка"}
+                    ]
+                }
+            }
+            text.insert("1.0", json.dumps(default, ensure_ascii=False, indent=2))
+
+        ttk.Label(dialog, text="Ключи столбцов: position, marking, name, quantity, mass_kg, total_mass, material, bending\n"
+                              "Цвета: hex (например 2F5496). Ширина столбцов Excel в символах.",
+                  font=("Arial", 8), foreground="gray").pack(pady=(0, 5))
+
+        def save_template():
+            try:
+                content = text.get("1.0", tk.END)
+                data = json.loads(content)
+                name = data.get("name", "template")
+                filename = name.lower().replace(" ", "_").replace("/", "_")
+                if not filename.startswith("template_"):
+                    filename = f"template_{filename}"
+                path = os.path.join(save_dir, f"{filename}.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self._log(f"Шаблон сохранён: {name}")
+                dialog.destroy()
+                parent_dialog.destroy()
+                self._show_template_dialog()
+            except json.JSONDecodeError as e:
+                messagebox.showerror("Ошибка", f"Неверный формат:\n{e}")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Сохранить", command=save_template).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+    def _show_prices_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Цены и калькулятор")
+        dialog.geometry("450x350")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Цены:", font=("Arial", 10)).pack(pady=(15, 5))
+
+        prices_path = os.path.join(os.path.dirname(__file__), "prices.json")
+        text = tk.Text(dialog, font=("Consolas", 9), width=50, height=15)
+        text.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+
+        if os.path.exists(prices_path):
+            with open(prices_path, "r", encoding="utf-8") as f:
+                text.insert("1.0", f.read())
+
+        ttk.Label(dialog, text="materials: цена за кг по названию. default_material_price: цена для неизвестных.\n"
+                              "labor: стоимость работ (cutting, bending, welding, assembly) за кг.",
+                  font=("Arial", 8), foreground="gray").pack(pady=(0, 5))
+
+        def save_prices():
+            try:
+                import json
+                content = text.get("1.0", tk.END)
+                json.loads(content)
+                with open(prices_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self._log("Цены сохранены")
+                messagebox.showinfo("Успех", "Цены сохранены!")
+            except json.JSONDecodeError as e:
+                messagebox.showerror("Ошибка", f"Неверный формат:\n{e}")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Сохранить", command=save_prices).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
     def run(self):
         self.root.mainloop()

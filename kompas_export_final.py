@@ -25,6 +25,7 @@ from docx import Document
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from fpdf import FPDF
 
 
 import re
@@ -50,7 +51,7 @@ def is_default_material(material: str) -> bool:
 class KompasExportFinal:
     """Финальный класс для экспорта сборки."""
 
-    def __init__(self):
+    def __init__(self, template=None):
         self.app = None
         self.doc = None
         self.doc3d = None
@@ -61,6 +62,18 @@ class KompasExportFinal:
         self.all_data = []
         self.all_positions = {}
         self.opened_docs = []
+        self.template = template or self._default_template()
+
+    def _default_template(self):
+        default_path = os.path.join(os.path.dirname(__file__), "template_default.json")
+        if os.path.exists(default_path):
+            return self.load_template(default_path)
+        return {"excel": {"columns": []}, "word": {"columns": []}}
+
+    def load_template(self, path):
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def connect(self):
         try:
@@ -319,17 +332,32 @@ class KompasExportFinal:
         self.opened_docs.clear()
 
     def generate_excel(self):
-        """Генерация Excel по формату эталона."""
+        """Генерация Excel по шаблону."""
         print("\nСоздание Excel файла...")
 
         wb = Workbook()
         ws = wb.active
         ws.title = os.path.splitext(self.assembly_name)[0][:31]
 
+        tmpl = self.template.get("excel", {})
+        columns = tmpl.get("columns", [])
+        if not columns:
+            columns = [
+                {"key": "position", "header": "Позиция", "width": 8},
+                {"key": "marking", "header": "Обозначение", "width": 25},
+                {"key": "name", "header": "Наименование", "width": 40},
+                {"key": "quantity", "header": "Кол-во", "width": 12},
+                {"key": "mass_kg", "header": "Масса, кг", "width": 12},
+                {"key": "material", "header": "Материал", "width": 25},
+                {"key": "bending", "header": "Гибка", "width": 8},
+            ]
+
+        header_color = tmpl.get("header_color", "2F5496")
+        assembly_color = tmpl.get("assembly_color", "D6E4F0")
+
         header_font = Font(bold=True, size=10, color="FFFFFF")
-        header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-        section_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-        assembly_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+        header_fill = PatternFill(start_color=header_color, end_color=header_color, fill_type="solid")
+        assembly_fill = PatternFill(start_color=assembly_color, end_color=assembly_color, fill_type="solid")
         border = Border(
             left=Side(style="thin"), right=Side(style="thin"),
             top=Side(style="thin"), bottom=Side(style="thin"),
@@ -337,90 +365,106 @@ class KompasExportFinal:
         center = Alignment(horizontal="center", vertical="center", wrap_text=True)
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-        headers = [
-            ("A", "Уровень", 8), ("B", "", 3), ("C", "", 3), ("D", "", 3), ("E", "", 3),
-            ("F", "Формат", 8), ("G", "Позиция", 8),
-            ("H", "№ деталей;\n№ сб., № п/сб.", 25), ("I", "Наименование", 40),
-            ("J", "Кол-во всего", 12), ("K", "Масса", 12), ("L", "Масса общая", 12),
-            ("M", "Материал", 25), ("N", "Гибка", 8),
-            ("O", "Материал\nзаменитель", 15), ("P", "Примечания", 15),
-            ("Q", "Старое\nобозначение", 15), ("R", "", 5),
-        ]
-        for col, title, width in headers:
-            cell = ws[f"{col}1"]
-            cell.value = title
+        for col_idx, col_def in enumerate(columns, 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.value = col_def.get("header", "")
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
             cell.border = border
-            ws.column_dimensions[col].width = width
+            col_letter = chr(64 + col_idx) if col_idx <= 26 else chr(64 + (col_idx - 1) // 26) + chr(65 + (col_idx - 1) % 26)
+            ws.column_dimensions[col_letter].width = col_def.get("width", 15)
+
+        if hasattr(self, 'cost_data') and self.cost_data:
+            cost_cols = [
+                {"key": "material_cost", "header": "Стоимость\nмат., руб", "width": 15},
+                {"key": "labor_cost", "header": "Стоимость\nработ, руб", "width": 15},
+                {"key": "total_cost", "header": "Итого, руб", "width": 15},
+            ]
+            for i, cc in enumerate(cost_cols):
+                col_idx = len(columns) + i + 1
+                cell = ws.cell(row=1, column=col_idx)
+                cell.value = cc["header"]
+                cell.font = header_font
+                cell.fill = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")
+                cell.alignment = center
+                cell.border = border
+                col_letter = chr(64 + col_idx) if col_idx <= 26 else chr(64 + (col_idx - 1) // 26) + chr(65 + (col_idx - 1) % 26)
+                ws.column_dimensions[col_letter].width = cc["width"]
+            columns = columns + cost_cols
+
         ws.row_dimensions[1].height = 35
 
         row = 2
+        cost_by_marking = {}
+        if hasattr(self, 'cost_data') and self.cost_data:
+            cost_by_marking = {c["marking"]: c for c in self.cost_data}
+
         for item in self.all_data:
-            level = item.get("level", 0)
             marking = item.get("marking", "")
             pos_info = self.all_positions.get(marking, {})
-            pos = pos_info.get("position", "")
             mass_kg = (item.get("mass", 0) or 0) / 1000
-            total_mass = mass_kg * item.get("quantity", 1)
             is_asm = item.get("is_assembly", False)
-            bending = "X" if item.get("is_bending") else ""
-            suffix = "  СБ" if is_asm else ""
 
-            fill = assembly_fill if is_asm else None
-
-            # Для сборок убираем материал по умолчанию
             material = item.get("material", "")
             if is_asm and is_default_material(material):
                 material = ""
 
-            values = [
-                level + 1 if level > 0 else "",  # A
-                "",  # B
-                "",  # C
-                "",  # D
-                "",  # E
-                "",  # F
-                pos,  # G
-                f"{marking}{suffix}",  # H
-                item.get("name", ""),  # I
-                item.get("quantity", 1),  # J
-                round(mass_kg, 6) if mass_kg > 0 else "",  # K
-                round(total_mass, 6) if total_mass > 0 else "",  # L
-                material,  # M
-                bending,  # N - Гибка
-                "",  # O
-                "",  # P
-                "",  # Q
-                "",  # R
-            ]
+            row_data = {
+                "position": pos_info.get("position", ""),
+                "marking": marking,
+                "name": item.get("name", ""),
+                "quantity": item.get("quantity", 1),
+                "mass_kg": round(mass_kg, 6) if mass_kg > 0 else "",
+                "total_mass": round(mass_kg * item.get("quantity", 1), 6) if mass_kg > 0 else "",
+                "material": material,
+                "bending": "X" if item.get("is_bending") else "",
+                "level": item.get("level", 0) + 1 if item.get("level", 0) > 0 else "",
+                "is_assembly": is_asm,
+            }
 
-            for col_idx, value in enumerate(values, 1):
+            if marking in cost_by_marking:
+                c = cost_by_marking[marking]
+                row_data["material_cost"] = c["material_cost"]
+                row_data["labor_cost"] = c["labor_cost"]
+                row_data["total_cost"] = c["total_cost"]
+
+            for col_idx, col_def in enumerate(columns, 1):
                 cell = ws.cell(row=row, column=col_idx)
-                cell.value = value
+                cell.value = row_data.get(col_def.get("key", ""), "")
                 cell.border = border
-                cell.alignment = left if col_idx in [4, 8, 9, 13, 17] else center
-                if fill:
-                    cell.fill = fill
+                cell.alignment = left if col_def.get("key") in ("name", "material") else center
+                if is_asm:
+                    cell.fill = assembly_fill
 
-            # Группировка для сборок (outline level)
-            if is_asm and level > 0:
-                ws.row_dimensions[row].outline_level = min(level, 8)
+            if is_asm and item.get("level", 0) > 0:
+                ws.row_dimensions[row].outline_level = min(item["level"], 8)
 
             row += 1
 
         row += 1
         total_mass = sum((item.get("mass", 0) or 0) / 1000 for item in self.all_data)
         ws.cell(row=row, column=1, value="ИТОГО:").font = Font(bold=True)
-        ws.cell(row=row, column=5, value=f"{len(self.all_data)} элементов").font = Font(bold=True)
-        ws.cell(row=row, column=7, value=round(total_mass, 3)).font = Font(bold=True)
+        ws.cell(row=row, column=2, value=f"{len(self.all_data)} элементов").font = Font(bold=True)
+        if any(c.get("key") == "mass_kg" for c in columns):
+            mass_col = next(i for i, c in enumerate(columns, 1) if c.get("key") == "mass_kg")
+            ws.cell(row=row, column=mass_col, value=round(total_mass, 3)).font = Font(bold=True)
 
-        # Включаем группировку через row_dimensions
+        if hasattr(self, 'cost_summary') and self.cost_summary:
+            cost_start = len(columns) - 2
+            ws.cell(row=row, column=cost_start, value="Материалы:").font = Font(bold=True)
+            ws.cell(row=row, column=cost_start + 1, value=self.cost_summary["total_material"]).font = Font(bold=True)
+            row += 1
+            ws.cell(row=row, column=cost_start, value="Работы:").font = Font(bold=True)
+            ws.cell(row=row, column=cost_start + 1, value=self.cost_summary["total_labor"]).font = Font(bold=True)
+            row += 1
+            ws.cell(row=row, column=cost_start, value="ИТОГО:").font = Font(bold=True, color="8B0000")
+            ws.cell(row=row, column=cost_start + 1, value=self.cost_summary["total"]).font = Font(bold=True, color="8B0000")
+
         for r in range(2, row):
             cell_a = ws.cell(row=r, column=1)
-            if cell_a.value and int(cell_a.value) > 1:
-                ws.row_dimensions[r].outline_level = min(int(cell_a.value) - 1, 8)
+            if cell_a.value and isinstance(cell_a.value, int) and cell_a.value > 1:
+                ws.row_dimensions[r].outline_level = min(cell_a.value - 1, 8)
                 ws.row_dimensions[r].hidden = False
 
         base_name = os.path.splitext(self.assembly_name)[0]
@@ -515,15 +559,118 @@ class KompasExportFinal:
         print(f"[OK] Word: {os.path.abspath(output_path)}")
         return output_path
 
+    def generate_pdf(self):
+        """Генерация PDF файла."""
+        print("\nСоздание PDF файла...")
+
+        pdf = FPDF(orientation="L", unit="mm", format="A4")
+        pdf.set_auto_page_break(auto=True, margin=15)
+
+        pdf.add_font("arial", "", "C:/Windows/Fonts/arial.ttf")
+        pdf.add_font("arial", "B", "C:/Windows/Fonts/arialbd.ttf")
+        font_name = "arial"
+
+        pdf.add_page()
+
+        base_name = os.path.splitext(self.assembly_name)[0]
+        base_designation = base_name.split('.')[0]
+
+        pdf_cols = [
+            {"key": "position", "header": "Поз.", "width": 15, "max_chars": 8},
+            {"key": "marking", "header": "Обозначение", "width": 35, "max_chars": 20},
+            {"key": "name", "header": "Наименование", "width": 80, "max_chars": 45},
+            {"key": "quantity", "header": "Кол-во", "width": 15, "max_chars": 8},
+            {"key": "mass_kg", "header": "Масса, кг", "width": 18, "max_chars": 10},
+            {"key": "material", "header": "Материал", "width": 50, "max_chars": 28},
+            {"key": "bending", "header": "Гибка", "width": 12, "max_chars": 5},
+        ]
+
+        header_color = self.template.get("excel", {}).get("header_color", "2F5496")
+        assembly_color = self.template.get("excel", {}).get("assembly_color", "D6E4F0")
+
+        r, g, b = int(header_color[0:2], 16), int(header_color[2:4], 16), int(header_color[4:6], 16)
+
+        pdf.set_font(font_name, "B", 14)
+        pdf.cell(0, 10, self.template.get("excel", {}).get("title", "СВОДНАЯ ВЕДОМОСТЬ"), ln=True, align="C")
+        pdf.set_font(font_name, "", 9)
+        pdf.cell(0, 7, f"Обозначение: {base_designation}   Наименование: {base_name}", ln=True, align="C")
+        pdf.ln(4)
+
+        pdf.set_font(font_name, "B", 7)
+        pdf.set_fill_color(r, g, b)
+        pdf.set_text_color(255, 255, 255)
+        for col_def in pdf_cols:
+            pdf.cell(col_def["width"], 7, col_def["header"], border=1, align="C", fill=True)
+        pdf.ln()
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font(font_name, "", 6)
+
+        ar, ag, ab = int(assembly_color[0:2], 16), int(assembly_color[2:4], 16), int(assembly_color[4:6], 16)
+
+        row_h = 6
+        for item in self.all_data:
+            marking = item.get("marking", "")
+            mass_kg = (item.get("mass", 0) or 0) / 1000
+            is_asm = item.get("is_assembly", False)
+            material = item.get("material", "")
+            if is_asm and is_default_material(material):
+                material = ""
+
+            if is_asm:
+                pdf.set_fill_color(ar, ag, ab)
+                fill = True
+            else:
+                fill = False
+
+            raw_row = {
+                "position": self.all_positions.get(marking, {}).get("position", ""),
+                "marking": marking,
+                "name": item.get("name", ""),
+                "quantity": str(item.get("quantity", 1)),
+                "mass_kg": f"{mass_kg:.3f}" if mass_kg > 0 else "",
+                "total_mass": f"{mass_kg * item.get('quantity', 1):.3f}" if mass_kg > 0 else "",
+                "material": material,
+                "bending": "X" if item.get("is_bending") else "",
+            }
+            for col_def in pdf_cols:
+                val = str(raw_row.get(col_def["key"], ""))
+                max_c = col_def.get("max_chars", 30)
+                if len(val) > max_c:
+                    val = val[:max_c - 3] + "..."
+                pdf.cell(col_def["width"], row_h, val, border=1, fill=fill)
+            pdf.ln()
+
+        pdf.ln(3)
+        total_mass = sum((item.get("mass", 0) or 0) / 1000 for item in self.all_data)
+        pdf.set_font(font_name, "B", 8)
+        pdf.cell(0, 7, f"ИТОГО: {len(self.all_data)} элементов, масса: {total_mass:.3f} кг", ln=True)
+
+        output_path = os.path.join(self.assembly_dir, f"{base_name}_сводная_ведомость.pdf")
+        pdf.output(output_path)
+        print(f"[OK] PDF: {os.path.abspath(output_path)}")
+        return output_path
+
     def _add_table(self, doc, items):
         if not items:
             return
-        table = doc.add_table(rows=len(items) + 1, cols=7)
+        tmpl_cols = self.template.get("word", {}).get("columns", [])
+        if not tmpl_cols:
+            tmpl_cols = [
+                {"key": "position", "header": "Поз."},
+                {"key": "marking", "header": "Обозначение"},
+                {"key": "name", "header": "Наименование"},
+                {"key": "quantity", "header": "Кол-во"},
+                {"key": "mass_kg", "header": "Масса, кг"},
+                {"key": "material", "header": "Материал"},
+                {"key": "bending", "header": "Гибка"},
+            ]
+        num_cols = len(tmpl_cols)
+        table = doc.add_table(rows=len(items) + 1, cols=num_cols)
         table.style = 'Table Grid'
-        headers = ['Поз.', 'Обозначение', 'Наименование', 'Кол-во', 'Масса, кг', 'Материал', 'Гибка']
-        for i, h in enumerate(headers):
+        for i, col_def in enumerate(tmpl_cols):
             cell = table.cell(0, i)
-            cell.text = h
+            cell.text = col_def.get("header", "")
             for p in cell.paragraphs:
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 for r in p.runs:
@@ -531,23 +678,96 @@ class KompasExportFinal:
                     r.font.size = Pt(9)
         for idx, item in enumerate(items, 1):
             marking = item.get("marking", "")
-            spec_pos = self.all_positions.get(marking, {}).get("position", str(idx))
             mass_kg = (item.get("mass", 0) or 0) / 1000
-            bending = "X" if item.get("is_bending") else ""
             is_asm = item.get("is_assembly", False)
             material = item.get("material", "")
             if is_asm and is_default_material(material):
                 material = ""
-            row_data = [spec_pos, marking, item.get("name", ""), str(item.get("quantity", 1)),
-                        f"{mass_kg:.3f}" if mass_kg > 0 else "", material, bending]
-            for col_idx, value in enumerate(row_data):
+            row_data = {
+                "position": self.all_positions.get(marking, {}).get("position", str(idx)),
+                "marking": marking,
+                "name": item.get("name", ""),
+                "quantity": str(item.get("quantity", 1)),
+                "mass_kg": f"{mass_kg:.3f}" if mass_kg > 0 else "",
+                "total_mass": f"{mass_kg * item.get('quantity', 1):.3f}" if mass_kg > 0 else "",
+                "material": material,
+                "bending": "X" if item.get("is_bending") else "",
+            }
+            for col_idx, col_def in enumerate(tmpl_cols):
                 cell = table.cell(idx, col_idx)
-                cell.text = value
+                cell.text = row_data.get(col_def.get("key", ""), "")
                 for p in cell.paragraphs:
                     for r in p.runs:
                         r.font.size = Pt(9)
 
-    def run(self, filepath=None):
+    def calculate_costs(self, prices=None):
+        """Расчёт стоимости по материалам и трудозатратам."""
+        if prices is None:
+            prices_path = os.path.join(os.path.dirname(__file__), "prices.json")
+            if os.path.exists(prices_path):
+                import json
+                with open(prices_path, "r", encoding="utf-8") as f:
+                    prices = json.load(f)
+            else:
+                prices = {}
+
+        materials = prices.get("materials", {})
+        default_price = prices.get("default_material_price", 100.0)
+        labor = prices.get("labor", {})
+
+        self.cost_data = []
+        total_material = 0
+        total_labor = 0
+
+        for item in self.all_data:
+            mass_kg = (item.get("mass", 0) or 0) / 1000
+            quantity = item.get("quantity", 1)
+            material = item.get("material", "").lower().strip()
+            is_asm = item.get("is_assembly", False)
+            is_bending = item.get("is_bending", False)
+
+            if is_asm and is_default_material(item.get("material", "")):
+                material = ""
+
+            mat_price = default_price
+            for mat_name, price in materials.items():
+                if material.startswith(mat_name.lower()):
+                    mat_price = price
+                    break
+
+            mat_cost = mass_kg * mat_price * quantity
+            labor_cost = 0
+            if not is_asm:
+                labor_cost += mass_kg * labor.get("cutting_per_kg", 0) * quantity
+                if is_bending:
+                    labor_cost += mass_kg * labor.get("bending_per_kg", 0) * quantity
+                labor_cost += mass_kg * labor.get("welding_per_kg", 0) * quantity
+                labor_cost += mass_kg * labor.get("assembly_per_kg", 0) * quantity
+
+            total = mat_cost + labor_cost
+            total_material += mat_cost
+            total_labor += labor_cost
+
+            self.cost_data.append({
+                "marking": item.get("marking", ""),
+                "name": item.get("name", ""),
+                "mass_kg": mass_kg,
+                "quantity": quantity,
+                "material_cost": round(mat_cost, 2),
+                "labor_cost": round(labor_cost, 2),
+                "total_cost": round(total, 2),
+            })
+
+        self.cost_summary = {
+            "total_material": round(total_material, 2),
+            "total_labor": round(total_labor, 2),
+            "total": round(total_material + total_labor, 2),
+        }
+        return self.cost_data, self.cost_summary
+
+    def run(self, filepath=None, formats=None):
+        if formats is None:
+            formats = {"excel", "word", "pdf"}
         try:
             if not self.connect():
                 return
@@ -556,13 +776,19 @@ class KompasExportFinal:
             if not self.extract_tree():
                 return
             self.read_positions()
-            excel_path = self.generate_excel()
-            word_path = self.generate_word()
+            results = {}
+            if "excel" in formats:
+                results["excel"] = self.generate_excel()
+            if "word" in formats:
+                results["word"] = self.generate_word()
+            if "pdf" in formats:
+                results["pdf"] = self.generate_pdf()
             print("\n" + "=" * 50)
             print("Готово!")
-            print(f"Excel: {excel_path}")
-            print(f"Word: {word_path}")
+            for fmt, path in results.items():
+                print(f"{fmt.capitalize()}: {path}")
             print("=" * 50)
+            return results
         finally:
             self.close_all_docs()
 
