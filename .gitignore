@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.exe
 *.spec
+*.spec.bak
 build/
 dist/
 *.egg-info/
