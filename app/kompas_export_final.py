@@ -63,6 +63,9 @@ class KompasExportFinal:
         self.all_positions = {}
         self.opened_docs = []
         self.template = template or self._default_template()
+        if template:
+            self._ensure_stock_length(self.template.get("excel", {}).get("columns"))
+            self._ensure_stock_length(self.template.get("word", {}).get("columns"))
 
     def _default_template(self):
         default_path = os.path.join(os.path.dirname(__file__), "template_default.json")
@@ -73,7 +76,24 @@ class KompasExportFinal:
     def load_template(self, path):
         import json
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            template = json.load(f)
+        self._ensure_stock_length(template.get("excel", {}).get("columns"))
+        self._ensure_stock_length(template.get("word", {}).get("columns"))
+        return template
+
+    @staticmethod
+    def _ensure_stock_length(columns):
+        """Добавление столбца "Длина сортамента" в шаблоны старых версий."""
+        if not columns:
+            return
+        if any(c.get("key") == "stock_length" for c in columns):
+            return
+        default = {"key": "stock_length", "header": "Длина сортамента", "width": 12}
+        for i, col in enumerate(columns):
+            if col.get("key") == "material":
+                columns.insert(i + 1, default)
+                return
+        columns.append(default)
 
     def connect(self):
         try:
@@ -207,7 +227,9 @@ class KompasExportFinal:
                 except:
                     pass
 
-                info["is_bending"] = self._check_bending(p7, info["name"])
+                info["is_bending"] = (
+                    self._check_unfold(p7) if not info["is_assembly"] else False
+                )
 
                 self.all_data.append(info)
 
@@ -216,29 +238,39 @@ class KompasExportFinal:
         except Exception as e:
             pass
 
-    def _check_bending(self, p7, name):
-        """Определение гнущихся деталей."""
-        name_lower = name.lower()
-        bending_keywords = [
-            "накладка", "пластина", "площадка", "стенка", "днище",
-            "крышка", "фланец", "обшивка", "настил", "бортик"
-        ]
-        for kw in bending_keywords:
-            if kw in name_lower:
-                return True
-
-        # Проверка по толщине
+    def _check_unfold(self, p7):
+        """Статус развертки: True, только если у детали есть листовое тело
+        и оно разогнуто (ISheetMetalBody.Straighten). Никаких предположений
+        по названию или толщине не делается."""
         try:
-            material = p7.Material or ""
-            import re
-            match = re.search(r'(\d+[\.,]?\d*)\s*(?:мм|$)', material)
-            if match:
-                thickness = float(match.group(1).replace(',', '.'))
-                if thickness <= 10:
-                    return True
-        except:
-            pass
+            container = win32com.client.CastTo(p7, "ISheetMetalContainer")
+            bodies = container.SheetMetalBodies
+        except Exception:
+            try:
+                bodies = p7.SheetMetalBodies
+            except Exception:
+                return False
 
+        try:
+            count = bodies.Count
+        except Exception:
+            return False
+
+        for i in range(count):
+            try:
+                body = bodies.SheetMetalBody(i)
+            except Exception:
+                try:
+                    body = bodies.Item(i)
+                except Exception:
+                    continue
+            if body is None:
+                continue
+            try:
+                if bool(body.Straighten):
+                    return True
+            except Exception:
+                pass
         return False
 
     def read_positions(self):
@@ -349,6 +381,7 @@ class KompasExportFinal:
                 {"key": "quantity", "header": "Кол-во", "width": 12},
                 {"key": "mass_kg", "header": "Масса, кг", "width": 12},
                 {"key": "material", "header": "Материал", "width": 25},
+                {"key": "stock_length", "header": "Длина сортамента", "width": 12},
                 {"key": "bending", "header": "Гибка", "width": 8},
             ]
 
@@ -420,6 +453,7 @@ class KompasExportFinal:
                 "mass_kg": round(mass_kg, 6) if mass_kg > 0 else "",
                 "total_mass": round(mass_kg * item.get("quantity", 1), 6) if mass_kg > 0 else "",
                 "material": material,
+                "stock_length": item.get("stock_length", ""),
                 "bending": "X" if item.get("is_bending") else "",
                 "level": item.get("level", 0) + 1 if item.get("level", 0) > 0 else "",
                 "is_assembly": is_asm,
@@ -445,12 +479,6 @@ class KompasExportFinal:
             row += 1
 
         row += 1
-        total_mass = sum((item.get("mass", 0) or 0) / 1000 * item.get("quantity", 1) for item in grouped_data)
-        ws.cell(row=row, column=1, value="ИТОГО:").font = Font(bold=True)
-        ws.cell(row=row, column=2, value=f"{len(grouped_data)} элементов").font = Font(bold=True)
-        if any(c.get("key") == "mass_kg" for c in columns):
-            mass_col = next(i for i, c in enumerate(columns, 1) if c.get("key") == "mass_kg")
-            ws.cell(row=row, column=mass_col, value=round(total_mass, 3)).font = Font(bold=True)
 
         if hasattr(self, 'cost_summary') and self.cost_summary:
             cost_start = len(columns) - 2
@@ -484,6 +512,8 @@ class KompasExportFinal:
                 merged[key] = item.copy()
             else:
                 merged[key]["quantity"] += item.get("quantity", 1)
+                if not merged[key].get("stock_length") and item.get("stock_length"):
+                    merged[key]["stock_length"] = item["stock_length"]
         return list(merged.values())
 
     def _grouped_data(self):
@@ -495,6 +525,8 @@ class KompasExportFinal:
                 grouped[key] = item.copy()
             else:
                 grouped[key]["quantity"] += item.get("quantity", 1)
+                if not grouped[key].get("stock_length") and item.get("stock_length"):
+                    grouped[key]["stock_length"] = item["stock_length"]
         return list(grouped.values())
 
     def generate_word(self):
@@ -564,9 +596,7 @@ class KompasExportFinal:
 
         doc.add_heading('ИТОГО', 1)
         grouped_data = self._grouped_data()
-        total_mass = sum((item.get("mass", 0) or 0) / 1000 * item.get("quantity", 1) for item in grouped_data)
         doc.add_paragraph(f'Всего элементов: {len(grouped_data)}')
-        doc.add_paragraph(f'Общая масса: {total_mass:.3f} кг')
 
         output_path = os.path.join(self.assembly_dir, f"{base_name}_сводная_ведомость.docx")
         doc.save(output_path)
@@ -596,6 +626,7 @@ class KompasExportFinal:
             {"key": "quantity", "header": "Кол-во", "width": 15, "max_chars": 8},
             {"key": "mass_kg", "header": "Масса, кг", "width": 18, "max_chars": 10},
             {"key": "material", "header": "Материал", "width": 50, "max_chars": 28},
+            {"key": "stock_length", "header": "Длина сортамента", "width": 20, "max_chars": 12},
             {"key": "bending", "header": "Гибка", "width": 12, "max_chars": 5},
         ]
 
@@ -646,6 +677,7 @@ class KompasExportFinal:
                 "mass_kg": f"{mass_kg:.3f}" if mass_kg > 0 else "",
                 "total_mass": f"{mass_kg * item.get('quantity', 1):.3f}" if mass_kg > 0 else "",
                 "material": material,
+                "stock_length": str(item.get("stock_length", "") or ""),
                 "bending": "X" if item.get("is_bending") else "",
             }
             for col_def in pdf_cols:
@@ -657,9 +689,8 @@ class KompasExportFinal:
             pdf.ln()
 
         pdf.ln(3)
-        total_mass = sum((item.get("mass", 0) or 0) / 1000 * item.get("quantity", 1) for item in grouped_data)
         pdf.set_font(font_name, "B", 8)
-        pdf.cell(0, 7, f"ИТОГО: {len(grouped_data)} элементов, масса: {total_mass:.3f} кг", ln=True)
+        pdf.cell(0, 7, f"ИТОГО: {len(grouped_data)} элементов", ln=True)
 
         output_path = os.path.join(self.assembly_dir, f"{base_name}_сводная_ведомость.pdf")
         pdf.output(output_path)
@@ -678,6 +709,7 @@ class KompasExportFinal:
                 {"key": "quantity", "header": "Кол-во"},
                 {"key": "mass_kg", "header": "Масса, кг"},
                 {"key": "material", "header": "Материал"},
+                {"key": "stock_length", "header": "Длина сортамента"},
                 {"key": "bending", "header": "Гибка"},
             ]
         num_cols = len(tmpl_cols)
@@ -706,6 +738,7 @@ class KompasExportFinal:
                 "mass_kg": f"{mass_kg:.3f}" if mass_kg > 0 else "",
                 "total_mass": f"{mass_kg * item.get('quantity', 1):.3f}" if mass_kg > 0 else "",
                 "material": material,
+                "stock_length": str(item.get("stock_length", "") or ""),
                 "bending": "X" if item.get("is_bending") else "",
             }
             for col_idx, col_def in enumerate(tmpl_cols):
@@ -780,30 +813,42 @@ class KompasExportFinal:
         }
         return self.cost_data, self.cost_summary
 
+    def analyze(self, filepath=None):
+        """Подключение к КОМПАС, открытие сборки, чтение дерева и позиций."""
+        if not self.connect():
+            return False
+        if not self.open_assembly(filepath):
+            return False
+        if not self.extract_tree():
+            return False
+        self.read_positions()
+        return True
+
+    def generate(self, formats=None):
+        """Формирование документов по выбранным форматам."""
+        if formats is None:
+            formats = {"excel", "word", "pdf"}
+        results = {}
+        if "excel" in formats:
+            results["excel"] = self.generate_excel()
+        if "word" in formats:
+            results["word"] = self.generate_word()
+        if "pdf" in formats:
+            results["pdf"] = self.generate_pdf()
+        print("\n" + "=" * 50)
+        print("Готово!")
+        for fmt, path in results.items():
+            print(f"{fmt.capitalize()}: {path}")
+        print("=" * 50)
+        return results
+
     def run(self, filepath=None, formats=None):
         if formats is None:
             formats = {"excel", "word", "pdf"}
         try:
-            if not self.connect():
+            if not self.analyze(filepath):
                 return
-            if not self.open_assembly(filepath):
-                return
-            if not self.extract_tree():
-                return
-            self.read_positions()
-            results = {}
-            if "excel" in formats:
-                results["excel"] = self.generate_excel()
-            if "word" in formats:
-                results["word"] = self.generate_word()
-            if "pdf" in formats:
-                results["pdf"] = self.generate_pdf()
-            print("\n" + "=" * 50)
-            print("Готово!")
-            for fmt, path in results.items():
-                print(f"{fmt.capitalize()}: {path}")
-            print("=" * 50)
-            return results
+            return self.generate(formats)
         finally:
             self.close_all_docs()
 

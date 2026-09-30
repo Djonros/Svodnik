@@ -10,6 +10,7 @@
       {"key": "mass_kg", "header": "Масса", "width": 12},
       {"key": "total_mass", "header": "Масса общая", "width": 12},
       {"key": "material", "header": "Материал", "width": 25},
+      {"key": "stock_length", "header": "Длина сортамента", "width": 12},
       {"key": "bending", "header": "Гибка", "width": 8}
     ],
     "header_color": "2F5496",
@@ -24,6 +25,7 @@
       {"key": "quantity", "header": "Кол-во"},
       {"key": "mass_kg", "header": "Масса, кг"},
       {"key": "material", "header": "Материал"},
+      {"key": "stock_length", "header": "Длина сортамента"},
       {"key": "bending", "header": "Гибка"}
     ]
   }

@@ -48,7 +48,7 @@ def add_to_recent(filepath):
 
 class KompasExportApp:
 
-    VERSION = "1.5.0"
+    VERSION = "1.6.2"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -67,9 +67,10 @@ class KompasExportApp:
         self.show_recent = tk.BooleanVar(value=False)
         self.show_log = tk.BooleanVar(value=False)
         self.export_excel = tk.BooleanVar(value=True)
-        self.export_word = tk.BooleanVar(value=True)
-        self.export_pdf = tk.BooleanVar(value=True)
+        self.export_word = tk.BooleanVar(value=False)
+        self.export_pdf = tk.BooleanVar(value=False)
         self.export_costs = tk.BooleanVar(value=False)
+        self.edit_before_export = tk.BooleanVar(value=False)
         self._spinner_running = False
         self._spinner_cycle = itertools.cycle(SPINNER_FRAMES)
         self._current_template = None
@@ -148,6 +149,8 @@ class KompasExportApp:
         ttk.Checkbutton(fmt_frame, text="Word", variable=self.export_word).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(fmt_frame, text="PDF", variable=self.export_pdf).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(fmt_frame, text="Стоимость", variable=self.export_costs).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(fmt_frame, text="Редактировать строки",
+                        variable=self.edit_before_export).pack(side=tk.LEFT, padx=8)
 
         # --- Кнопка ЭКСПОРТ + Спиннер ---
         action_frame = ttk.Frame(self.root)
@@ -320,6 +323,23 @@ class KompasExportApp:
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
+    def _log_output(self, output):
+        for line in output.strip().split("\n"):
+            if line.strip():
+                self._log(line)
+
+    @staticmethod
+    def _run_captured(func, *args, **kwargs):
+        """Запуск функции с перехватом stdout (печать экспорта попадает в лог)."""
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            result = func(*args, **kwargs)
+            return result, sys.stdout.getvalue()
+        finally:
+            sys.stdout = old_stdout
+
     def _export(self):
         if not self.license.is_valid():
             remaining = self.license.MAX_EXPORTS_TRIAL - self.license.exports_count
@@ -356,26 +376,31 @@ class KompasExportApp:
         fmt_list = ", ".join(sorted(formats)).upper()
         self._log(f"Начало экспорта ({fmt_list})...")
 
+        exporter = KompasExportFinal(template=self._current_template)
         try:
-            exporter = KompasExportFinal(template=self._current_template)
+            ok, output = self._run_captured(exporter.analyze, filepath)
+            self._log_output(output)
+            if not ok:
+                raise RuntimeError("Не удалось подключиться к КОМПАС "
+                                   "или открыть сборку (см. лог выше)")
 
-            import io
-            old_stdout = sys.stdout
-            sys.stdout = io.StringIO()
+            if self.edit_before_export.get():
+                from row_editor import RowEditorDialog
+                editor = RowEditorDialog(self.root, exporter.all_data)
+                self.root.wait_window(editor)
+                if not editor.applied:
+                    self._log("Экспорт отменен в редакторе строк")
+                    return
+
+            _, output = self._run_captured(exporter.generate, formats)
+            self._log_output(output)
 
             if self.export_costs.get():
-                exporter.run(filepath, formats=formats)
-                exporter.calculate_costs()
+                _, output = self._run_captured(exporter.calculate_costs)
+                self._log_output(output)
                 if "excel" in formats:
-                    exporter.generate_excel()
-            else:
-                exporter.run(filepath, formats=formats)
-
-            output = sys.stdout.getvalue()
-            sys.stdout = old_stdout
-
-            for line in output.strip().split('\n'):
-                self._log(line)
+                    _, output = self._run_captured(exporter.generate_excel)
+                    self._log_output(output)
 
             add_to_recent(filepath)
             self._load_recent_list()
@@ -390,6 +415,7 @@ class KompasExportApp:
             self._log(f"Ошибка: {str(e)}")
             messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{str(e)}")
         finally:
+            self._run_captured(exporter.close_all_docs)
             self._stop_spinner()
             self.export_btn.config(state="normal")
 
@@ -561,6 +587,7 @@ class KompasExportApp:
                         {"key": "quantity", "header": "Кол-во", "width": 12},
                         {"key": "mass_kg", "header": "Масса, кг", "width": 12},
                         {"key": "material", "header": "Материал", "width": 25},
+                        {"key": "stock_length", "header": "Длина сортамента", "width": 12},
                         {"key": "bending", "header": "Гибка", "width": 8}
                     ],
                     "header_color": "2F5496",
@@ -575,13 +602,14 @@ class KompasExportApp:
                         {"key": "quantity", "header": "Кол-во"},
                         {"key": "mass_kg", "header": "Масса, кг"},
                         {"key": "material", "header": "Материал"},
+                        {"key": "stock_length", "header": "Длина сортамента"},
                         {"key": "bending", "header": "Гибка"}
                     ]
                 }
             }
             text.insert("1.0", json.dumps(default, ensure_ascii=False, indent=2))
 
-        ttk.Label(dialog, text="Ключи столбцов: position, marking, name, quantity, mass_kg, total_mass, material, bending\n"
+        ttk.Label(dialog, text="Ключи столбцов: position, marking, name, quantity, mass_kg, total_mass, material, stock_length, bending\n"
                               "Цвета: hex (например 2F5496). Ширина столбцов Excel в символах.",
                   font=("Arial", 8), foreground="gray").pack(pady=(0, 5))
 
