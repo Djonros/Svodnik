@@ -65,6 +65,8 @@ class KompasExportFinal:
         self.model_counts = {}
         self.quantity_warnings = []
         self.problems = []
+        self.assembly_files = {}
+        self.generated_specs = []
         self.bend_cache = {}
         self.length_cache = {}
         self.opened_docs = []
@@ -147,6 +149,9 @@ class KompasExportFinal:
         self.all_data = []
         self.model_counts = {}
         self.problems = []
+        self.assembly_files = {}
+        if self.top_part.Marking:
+            self.assembly_files[self.top_part.Marking] = self.doc.PathName
 
         # Добавляем корень (главную сборку)
         root_info = {
@@ -265,6 +270,8 @@ class KompasExportFinal:
                 child_parts = p7.Parts
                 if child_parts and child_parts.Count > 0:
                     info["is_assembly"] = True
+                    if marking and file_key:
+                        self.assembly_files.setdefault(marking, p7.FileName)
             except Exception as e:
                 self._problem(f"Не прочитан состав {label} в '{parent_name}', "
                               f"компонент учтен как деталь: {e}")
@@ -517,9 +524,6 @@ class KompasExportFinal:
                     all_spw.append(os.path.join(search_dir, f))
 
         print(f"  Найдено .spw файлов: {len(all_spw)}")
-        if not all_spw:
-            self._problem("Не найдены спецификации (*СП*.spw) рядом со сборкой и на "
-                          "уровень выше: позиции не заполнены, сверка количества не сделана")
         for spw in all_spw:
             try:
                 positions = self._read_spw(spw)
@@ -530,9 +534,61 @@ class KompasExportFinal:
             except Exception as e:
                 self._problem(f"Не прочитана спецификация {os.path.basename(spw)}: {e}")
 
+        self.create_missing_specs()
+
         print(f"[OK] Найдено позиций: {len(self.all_positions)}")
         self.check_quantities()
         return True
+
+    def _has_spec(self, marking):
+        key = self._norm(marking)
+        return any(self._norm(f).startswith(key) for f in self.spec_quantities)
+
+    def create_missing_specs(self):
+        """Для сборок, у которых не нашлось своей .spw, спецификация создается
+        по модели (из объектов спецификации ее деталей) и сохраняется в папку
+        "Генерированные спецификации". Сборки при этом не меняются: связь
+        со спецификацией не передается в модель. Позиции и количества из созданной
+        спецификации используются так же, как из обычной."""
+        self.generated_specs = []
+        missing = [(m, f) for m, f in self.assembly_files.items()
+                   if m and f and not self._has_spec(m)]
+        if not missing:
+            return
+        os.makedirs(self.specs_dir, exist_ok=True)
+        for marking, asm_path in missing:
+            safe = re.sub(r'[\\/:*?"<>|]', "_", marking).strip()
+            spw_path = os.path.join(self.specs_dir, f"{safe} СП.spw")
+            print(f"  Создание спецификации {os.path.basename(spw_path)}...")
+            doc = None
+            try:
+                doc = win32com.client.CastTo(
+                    self.app.Documents.AddWithDefaultSettings(3, False),  # ksDocumentSpecification
+                    "ISpecificationDocument")
+                doc.AttachedDocuments.AddDocument(asm_path, False, True, "")
+                positions = self._read_spec_doc(doc, os.path.basename(spw_path))
+                if not positions:
+                    self._problem(f"Спецификация для {marking} создана пустой: у деталей "
+                                  f"сборки нет объектов спецификации")
+                    continue
+                doc.SaveAs(spw_path)
+                self.all_positions.update(
+                    {d: p for d, p in positions.items() if d not in self.all_positions})
+                self.spec_quantities[os.path.basename(spw_path)] = {
+                    d: p["quantity"] for d, p in positions.items()
+                }
+                self.generated_specs.append(spw_path)
+            except Exception as e:
+                self._problem(f"Не удалось создать спецификацию для {marking}: {e}")
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(0)
+                    except Exception:
+                        pass
+        if self.generated_specs:
+            print(f"[OK] Создано спецификаций: {len(self.generated_specs)} "
+                  f"(папка {self.specs_dir})")
 
     @staticmethod
     def _parse_qty(text):
@@ -584,15 +640,22 @@ class KompasExportFinal:
 
     def _read_spw(self, spw_path):
         """Чтение позиций из .spw файла."""
-        positions = {}
         try:
             doc = self.app.Documents.Open(spw_path)
             self.opened_docs.append(doc)
             time.sleep(0.5)
+            return self._read_spec_doc(doc, os.path.basename(spw_path))
+        except Exception as e:
+            self._problem(f"Не открыта спецификация {os.path.basename(spw_path)}: {e}")
+            return {}
 
+    def _read_spec_doc(self, doc, label):
+        """Позиции из открытого документа спецификации: {обозначение: {...}}."""
+        positions = {}
+        try:
             sd = doc.SpecificationDescriptions
             if not sd or sd.Count == 0:
-                self._problem(f"В спецификации {os.path.basename(spw_path)} нет описания, "
+                self._problem(f"В спецификации {label} нет описания, "
                               f"позиции из нее не прочитаны")
                 return positions
 
@@ -600,7 +663,7 @@ class KompasExportFinal:
 
             # Проверяем нужно ли перестроить
             if spec_desc.NeedRebuild:
-                print(f"  Перестроение спецификации: {os.path.basename(spw_path)}...")
+                print(f"  Перестроение спецификации: {label}...")
                 spec_desc.Update()
                 time.sleep(1)
 
@@ -635,10 +698,9 @@ class KompasExportFinal:
                     bad_rows += 1
                     continue
             if bad_rows:
-                self._problem(f"В спецификации {os.path.basename(spw_path)} не прочитано "
-                              f"строк: {bad_rows}")
+                self._problem(f"В спецификации {label} не прочитано строк: {bad_rows}")
         except Exception as e:
-            self._problem(f"Не открыта спецификация {os.path.basename(spw_path)}: {e}")
+            self._problem(f"Не прочитана спецификация {label}: {e}")
 
         return positions
 
@@ -646,8 +708,8 @@ class KompasExportFinal:
         """Закрытие всех открытых документов."""
         for doc in self.opened_docs:
             try:
-                if doc and not doc.Closed:
-                    doc.Close()
+                if doc:
+                    doc.Close(0)  # спецификации только читались: без сохранения
             except:
                 pass
         self.opened_docs.clear()
@@ -1110,7 +1172,23 @@ class KompasExportFinal:
             return False
         if not self.extract_tree():
             return False
-        self.read_positions()
+        # Вопросы КОМПАС при открытии и создании спецификаций ("Перестроить
+        # спецификацию?" и т.п.) останавливали бы фоновую работу: на время чтения
+        # отвечаем на них "Нет" автоматически (перестроение делаем сами).
+        old_hide = None
+        try:
+            old_hide = self.app.HideMessage
+            self.app.HideMessage = 2  # ksHideMessageNo
+        except Exception:
+            pass
+        try:
+            self.read_positions()
+        finally:
+            if old_hide is not None:
+                try:
+                    self.app.HideMessage = old_hide
+                except Exception:
+                    pass
         return True
 
     def generate(self, formats=None):

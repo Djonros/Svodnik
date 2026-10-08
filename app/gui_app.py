@@ -71,7 +71,7 @@ def add_to_recent(filepath):
 
 class KompasExportApp:
 
-    VERSION = "1.6.5"
+    VERSION = "1.6.6"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -497,6 +497,13 @@ class KompasExportApp:
         self._finish_export()
 
         message = "Экспорт завершен!\nФайлы сохранены в папке сборки."
+        generated = getattr(exporter, "generated_specs", [])
+        if generated:
+            names = "\n".join(os.path.basename(p) for p in generated[:8])
+            more = f"\n... и еще {len(generated) - 8}" if len(generated) > 8 else ""
+            message += (f"\n\nСпецификаций не было, созданы автоматически "
+                        f"в папке \"Генерированные спецификации\" ({len(generated)}):\n{names}{more}")
+            self._log(f"Создано спецификаций: {len(generated)}")
         sections = []
         for title, items in (
             ("Ошибки чтения из КОМПАС, ведомость может быть неполной", exporter.problems),
