@@ -156,7 +156,7 @@ class Tooltip:
 
 class KompasExportApp:
 
-    VERSION = "1.7.0"
+    VERSION = "1.7.1"
     APP_NAME = "Сводник"
 
     def __init__(self):

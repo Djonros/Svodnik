@@ -3,7 +3,9 @@
 
 Модальный диалог для просмотра и правки строк перед формированием
 документов: изменение обозначения, наименования, количества, материала,
-гибки и длины сортамента, добавление и удаление строк.
+гибки и длины сортамента, добавление и удаление строк, поиск, фильтр
+и сортировка по столбцам (сортировка меняет только вид, порядок строк
+в документах остается прежним).
 """
 
 import tkinter as tk
@@ -17,6 +19,9 @@ class RowEditorDialog(tk.Toplevel):
     HEADERS = ("✓", "№", "Обозначение", "Наименование", "Кол-во", "Материал", "Гибка", "Длина сортамента")
     WIDTHS = (30, 36, 130, 260, 60, 150, 50, 110)
 
+    FILTERS = ("Все строки", "Только детали", "Только сборки", "Гнутые",
+               "С длиной сортамента", "Без материала")
+
     CHECK_ON = "☑"
     CHECK_OFF = "☐"
 
@@ -29,17 +34,39 @@ class RowEditorDialog(tk.Toplevel):
 
         self.all_data = all_data
         self.applied = False
+        self._sort_col = None
+        self._sort_desc = False
 
         self._setup_ui()
         self._reload()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.bind("<Escape>", lambda event: self._on_cancel())
+        self.bind("<Control-f>", lambda event: self._focus_search())
+        self.bind("<Control-F>", lambda event: self._focus_search())
 
     def _setup_ui(self):
         ttk.Label(self, text="Проверьте строки ведомости. Отмечайте строки галочками в первом "
                              "столбце или выделяйте мышью (Ctrl/Shift, протягивание). Для "
                              "выделенных применяется материал, гибка и длина сортамента.",
                   font=("Arial", 9), foreground="gray").pack(anchor="w", padx=15, pady=(10, 5))
+
+        search_row = ttk.Frame(self)
+        search_row.pack(fill=tk.X, padx=15, pady=(0, 2))
+        ttk.Label(search_row, text="Поиск:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var, width=32)
+        self.search_entry.pack(side=tk.LEFT, padx=(5, 4))
+        ttk.Button(search_row, text="✕", width=3,
+                   command=lambda: self.search_var.set("")).pack(side=tk.LEFT)
+        ttk.Label(search_row, text="Показать:").pack(side=tk.LEFT, padx=(16, 5))
+        self.filter_var = tk.StringVar(value=self.FILTERS[0])
+        filter_box = ttk.Combobox(search_row, textvariable=self.filter_var, values=self.FILTERS,
+                                  state="readonly", width=22)
+        filter_box.pack(side=tk.LEFT)
+        self.count_label = ttk.Label(search_row, text="", foreground="gray")
+        self.count_label.pack(side=tk.RIGHT)
+        self.search_var.trace_add("write", lambda *args: self._reload())
+        filter_box.bind("<<ComboboxSelected>>", lambda event: self._reload())
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
@@ -54,7 +81,10 @@ class RowEditorDialog(tk.Toplevel):
                                  yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
         for col, header, width in zip(self.COLUMNS, self.HEADERS, self.WIDTHS):
             anchor = tk.W if col in ("marking", "name", "material") else tk.CENTER
-            self.tree.heading(col, text=header)
+            if col == "check":
+                self.tree.heading(col, text=header)
+            else:
+                self.tree.heading(col, text=header, command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=width, anchor=anchor, stretch=(col in ("name", "material")))
         self.tree.pack(fill=tk.BOTH, expand=True)
         y_scroll.config(command=self.tree.yview)
@@ -118,7 +148,14 @@ class RowEditorDialog(tk.Toplevel):
 
         self.tree.delete(*self.tree.get_children())
         selected = set(selected)
-        for idx, item in enumerate(self.all_data):
+        indices = [i for i, item in enumerate(self.all_data) if self._matches(item)]
+        if self._sort_col:
+            indices.sort(key=lambda i: self._sort_key(i, self._sort_col), reverse=self._sort_desc)
+        self.count_label.config(
+            text=f"Показано {len(indices)} из {len(self.all_data)}"
+            + (" · сортировка меняет только вид" if self._sort_col else ""))
+        for idx in indices:
+            item = self.all_data[idx]
             tags = []
             if item.get("manual"):
                 tags.append("manual")
@@ -140,6 +177,66 @@ class RowEditorDialog(tk.Toplevel):
         if valid:
             self.tree.selection_set(valid)
             self.tree.see(valid[0])
+
+    def _focus_search(self):
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, tk.END)
+
+    def _matches(self, item):
+        """Строка проходит поиск и фильтр."""
+        text = self.search_var.get().strip().lower()
+        if text:
+            hay = " ".join(str(item.get(k, "") or "") for k in ("marking", "name", "material")).lower()
+            if text not in hay:
+                return False
+        mode = self.filter_var.get()
+        if mode == "Только детали":
+            return not item.get("is_assembly")
+        if mode == "Только сборки":
+            return bool(item.get("is_assembly"))
+        if mode == "Гнутые":
+            return bool(item.get("is_bending"))
+        if mode == "С длиной сортамента":
+            return bool(str(item.get("stock_length", "") or "").strip())
+        if mode == "Без материала":
+            return not item.get("is_assembly") and not str(item.get("material", "") or "").strip()
+        return True
+
+    @staticmethod
+    def _number(value):
+        try:
+            return float(str(value).replace(",", ".").strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _sort_key(self, idx, col):
+        """Ключ сортировки; пустые значения в конце списка при любом направлении."""
+        item = self.all_data[idx]
+        empty = -1 if self._sort_desc else 1
+        if col == "num":
+            return (0, idx)
+        if col == "bending":
+            return (0, 1 if item.get("is_bending") else 0)
+        if col in ("quantity", "stock_length"):
+            n = self._number(item.get(col, ""))
+            return (empty, 0) if n is None else (0, n)
+        text = str(item.get(col, "") or "").strip().lower()
+        return (0, text) if text else (empty, "")
+
+    def _sort_by(self, col):
+        """Сортировка по столбцу: повторный щелчок меняет направление, третий снимает."""
+        if self._sort_col == col and not self._sort_desc:
+            self._sort_desc = True
+        elif self._sort_col == col:
+            self._sort_col, self._sort_desc = None, False
+        else:
+            self._sort_col, self._sort_desc = col, False
+        for c, header in zip(self.COLUMNS, self.HEADERS):
+            arrow = ""
+            if c == self._sort_col:
+                arrow = " ▼" if self._sort_desc else " ▲"
+            self.tree.heading(c, text=header + arrow)
+        self._reload()
 
     def _render_checks(self):
         current = set(self.tree.selection())
