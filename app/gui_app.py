@@ -8,12 +8,15 @@ import os
 import json
 import queue
 import threading
+import time
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
 from license import LicenseManager
 from kompas_export_final import KompasExportFinal
+import updater
 
 
 RECENT_FILE = os.path.join(os.path.expanduser("~"), ".svodnik_recent.json")
@@ -156,7 +159,7 @@ class Tooltip:
 
 class KompasExportApp:
 
-    VERSION = "1.7.1"
+    VERSION = "1.8.0"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -186,6 +189,7 @@ class KompasExportApp:
         self.export_costs = tk.BooleanVar(value=s.get("costs", False))
         self.edit_before_export = tk.BooleanVar(value=s.get("edit_rows", False))
         self.open_after_export = tk.BooleanVar(value=s.get("open_after", False))
+        self.auto_update = tk.BooleanVar(value=s.get("auto_update", True))
         self._current_template = None
         self._template_name = "По умолчанию"
         self._busy = False
@@ -216,6 +220,7 @@ class KompasExportApp:
         if s.get("zoomed"):
             self.root.state("zoomed")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(2000, self._auto_check_updates)
 
     # ------------------------------------------------------------------ оформление
 
@@ -313,6 +318,7 @@ class KompasExportApp:
             "costs": self.export_costs.get(),
             "edit_rows": self.edit_before_export.get(),
             "open_after": self.open_after_export.get(),
+            "auto_update": self.auto_update.get(),
         })
         save_settings(self.settings)
 
@@ -349,6 +355,10 @@ class KompasExportApp:
         menubar.add_cascade(label="Настройки", menu=settings_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Проверить обновления...", command=self._check_updates)
+        help_menu.add_checkbutton(label="Проверять обновления при запуске",
+                                  variable=self.auto_update)
+        help_menu.add_separator()
         help_menu.add_command(label="Горячие клавиши", command=self._show_shortcuts)
         help_menu.add_command(label="О программе", command=self._show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
@@ -509,6 +519,158 @@ class KompasExportApp:
             "в Excel, Word и PDF: позиции, количество, масса,\n"
             "материал, длина сортамента, гибка.\n\n"
             "GitHub: github.com/Djonros/Svodnik")
+
+    # ------------------------------------------------------------------ обновления
+
+    def _auto_check_updates(self):
+        if not self.auto_update.get():
+            return
+        last = self.settings.get("update_checked", 0)
+        if time.time() - last < 12 * 3600:
+            return
+        self._check_updates(manual=False)
+
+    def _check_updates(self, manual=True):
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+        result = {}
+
+        def work():
+            try:
+                result["info"] = updater.check_latest()
+            except Exception as e:
+                result["error"] = e
+            result["done"] = True
+
+        def poll():
+            if not result.get("done"):
+                self.root.after(300, poll)
+                return
+            self._update_checking = False
+            self._on_update_result(result.get("info"), result.get("error"), manual)
+
+        threading.Thread(target=work, daemon=True).start()
+        poll()
+
+    def _on_update_result(self, info, error, manual):
+        if error is not None:
+            if manual:
+                messagebox.showerror("Обновления",
+                    f"Не удалось проверить обновления.\nПроверьте подключение к интернету.\n\n{error}")
+            return
+        self.settings["update_checked"] = time.time()
+        if not info or not updater.is_newer(info["version"], self.VERSION):
+            if manual:
+                messagebox.showinfo("Обновления", f"У вас последняя версия ({self.VERSION}).")
+            return
+        if not manual and self.settings.get("skip_version") == info["version"]:
+            return
+        self._show_update_dialog(info)
+
+    def _show_update_dialog(self, info):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Доступно обновление")
+        dialog.configure(background=COLOR_BG)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"Вышла версия {info['version']}",
+                  font=(FONT, 13, "bold")).pack(anchor="w")
+        ttk.Label(body, text=f"У вас установлена версия {self.VERSION}.",
+                  foreground=COLOR_MUTED).pack(anchor="w", pady=(2, 10))
+        if info.get("notes"):
+            ttk.Label(body, text="Что нового:").pack(anchor="w")
+            notes = tk.Text(body, width=60, height=10, wrap="word", font=(FONT, 10),
+                            relief="solid", borderwidth=1, background=COLOR_CARD)
+            notes.insert("1.0", info["notes"])
+            notes.config(state="disabled")
+            notes.pack(fill=tk.BOTH, pady=(2, 10))
+        progress = ttk.Progressbar(body, mode="determinate", maximum=100)
+        progress_label = ttk.Label(body, text="", foreground=COLOR_MUTED)
+        ttk.Checkbutton(body, text="Проверять обновления при запуске",
+                        variable=self.auto_update).pack(anchor="w", pady=(0, 10))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X)
+
+        self_update = updater.can_self_update() and info.get("asset_url")
+
+        def skip():
+            self.settings["skip_version"] = info["version"]
+            dialog.destroy()
+
+        def start():
+            if not self_update:
+                webbrowser.open(info["page"])
+                dialog.destroy()
+                return
+            if self._busy:
+                messagebox.showwarning("Обновление",
+                    "Дождитесь окончания экспорта, потом обновите программу.", parent=dialog)
+                return
+            for child in buttons.winfo_children():
+                child.config(state="disabled")
+            progress.pack(fill=tk.X, pady=(0, 4), before=buttons)
+            progress_label.pack(anchor="w", pady=(0, 10), before=buttons)
+            self._download_update(info, dialog, progress, progress_label, buttons)
+
+        ttk.Button(buttons, text="Обновить сейчас" if self_update else "Открыть страницу загрузки",
+                   style="Accent.TButton", command=start).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Позже", command=dialog.destroy).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(buttons, text="Пропустить версию", command=skip).pack(side=tk.LEFT)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 3
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _download_update(self, info, dialog, progress, progress_label, buttons):
+        dest = updater.temp_download_path()
+        state = {"done": 0, "total": info.get("size") or 0}
+
+        def report(done, total):
+            state["done"], state["total"] = done, total or state["total"]
+
+        def work():
+            try:
+                updater.download(info["asset_url"], dest, report)
+            except Exception as e:
+                state["error"] = e
+            state["finished"] = True
+
+        def poll():
+            if not dialog.winfo_exists():
+                return
+            total = state["total"]
+            mb = state["done"] / 1048576
+            if total:
+                progress["value"] = state["done"] * 100 / total
+                progress_label.config(text=f"Загрузка: {mb:.1f} из {total / 1048576:.1f} МБ")
+            else:
+                progress_label.config(text=f"Загрузка: {mb:.1f} МБ")
+            if not state.get("finished"):
+                dialog.after(200, poll)
+                return
+            if "error" in state:
+                progress_label.config(text="")
+                for child in buttons.winfo_children():
+                    child.config(state="normal")
+                messagebox.showerror("Обновление",
+                    f"Не удалось скачать обновление:\n{state['error']}", parent=dialog)
+                return
+            progress_label.config(text="Загружено. Программа перезапустится.")
+            dialog.update_idletasks()
+            try:
+                updater.install_and_restart(dest)
+            except Exception as e:
+                messagebox.showerror("Обновление", f"Не удалось установить обновление:\n{e}",
+                                     parent=dialog)
+                return
+            self._save_settings()
+            self.root.destroy()
+
+        threading.Thread(target=work, daemon=True).start()
+        poll()
 
     def _show_shortcuts(self):
         messagebox.showinfo("Горячие клавиши",
