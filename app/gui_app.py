@@ -6,7 +6,6 @@ GUI приложение для экспорта спецификаций из �
 import sys
 import os
 import json
-import itertools
 import queue
 import threading
 import tkinter as tk
@@ -19,7 +18,6 @@ from kompas_export_final import KompasExportFinal
 
 RECENT_FILE = os.path.join(os.path.expanduser("~"), ".svodnik_recent.json")
 MAX_RECENT = 10
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 class _QueueWriter:
@@ -69,13 +67,106 @@ def add_to_recent(filepath):
     return files
 
 
+SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".svodnik_settings.json")
+
+# Цвета оформления
+COLOR_BG = "#F3F5F9"
+COLOR_CARD = "#FFFFFF"
+COLOR_BORDER = "#D9DEE7"
+COLOR_ACCENT = "#2F5496"
+COLOR_ACCENT_DARK = "#1F3D7A"
+COLOR_HEADER = "#1F3864"
+COLOR_TEXT = "#1E2430"
+COLOR_MUTED = "#6B7385"
+COLOR_OK = "#2E7D32"
+COLOR_WARN = "#B26A00"
+COLOR_ERR = "#C62828"
+FONT = "Segoe UI"
+
+# Этапы экспорта: (текст, доля прогресса). Этап определяется по строкам лога ядра.
+STAGES = [
+    ("Подключено к КОМПАС", "Чтение сборки...", 15),
+    ("Найдено элементов", "Чтение спецификаций...", 45),
+    ("Создание спецификации", "Создание недостающих спецификаций...", 55),
+    ("Сверка количества", "Подготовка данных...", 70),
+    ("Создание Excel", "Формирование Excel...", 80),
+    ("Создание Word", "Формирование Word...", 88),
+    ("Создание PDF", "Формирование PDF...", 94),
+]
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def open_path(path):
+    """Открыть файл или папку программой Windows по умолчанию."""
+    try:
+        os.startfile(path)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось открыть:\n{path}\n\n{e}")
+
+
+class Tooltip:
+    """Всплывающая подсказка при наведении на элемент."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        if self._tip:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self._tip, text=self.text, justify=tk.LEFT, background="#FFFDE8",
+                 foreground=COLOR_TEXT, relief="solid", borderwidth=1,
+                 font=(FONT, 9), padx=6, pady=3, wraplength=360).pack()
+
+    def _hide(self, _event=None):
+        if self._after:
+            self.widget.after_cancel(self._after)
+            self._after = None
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
 class KompasExportApp:
 
-    VERSION = "1.6.6"
+    VERSION = "1.7.0"
     APP_NAME = "Сводник"
 
     def __init__(self):
         self.license = LicenseManager()
+        # Четкий текст на мониторах с масштабированием Windows
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
         try:
             from tkinterdnd2 import TkinterDnD
             self.root = TkinterDnD.Tk()
@@ -83,178 +174,348 @@ class KompasExportApp:
         except Exception:
             self.root = tk.Tk()
             self._dnd_available = False
-        self.root.title(f"{self.APP_NAME} v{self.VERSION}")
-        self.root.geometry("620x340")
-        self.root.resizable(False, True)
+        self.root.title(f"{self.APP_NAME} {self.VERSION}")
+        self.root.configure(background=COLOR_BG)
 
-        self.show_recent = tk.BooleanVar(value=False)
-        self.show_log = tk.BooleanVar(value=False)
-        self.export_excel = tk.BooleanVar(value=True)
-        self.export_word = tk.BooleanVar(value=False)
-        self.export_pdf = tk.BooleanVar(value=False)
-        self.export_costs = tk.BooleanVar(value=False)
-        self.edit_before_export = tk.BooleanVar(value=False)
-        self._spinner_running = False
-        self._spinner_cycle = itertools.cycle(SPINNER_FRAMES)
+        self.settings = load_settings()
+        s = self.settings
+        self.show_log = tk.BooleanVar(value=s.get("show_log", False))
+        self.export_excel = tk.BooleanVar(value=s.get("excel", True))
+        self.export_word = tk.BooleanVar(value=s.get("word", False))
+        self.export_pdf = tk.BooleanVar(value=s.get("pdf", False))
+        self.export_costs = tk.BooleanVar(value=s.get("costs", False))
+        self.edit_before_export = tk.BooleanVar(value=s.get("edit_rows", False))
+        self.open_after_export = tk.BooleanVar(value=s.get("open_after", False))
         self._current_template = None
+        self._template_name = "По умолчанию"
         self._busy = False
         self._export_ctx = None
+        self._last_results = {}
+        self._last_issues = []
 
+        self._setup_style()
+        self._set_icon()
         self._setup_menu()
         self._setup_ui()
+        self._setup_shortcuts()
         self._update_status()
         self._load_recent_list()
         self._setup_dragdrop()
+        self._rebuild_panels()
+        scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        self.root.minsize(int(640 * scale), int(430 * scale))
+        geometry = f"{int(780 * scale)}x{int(600 * scale)}"
+        saved = s.get("geometry", "")
+        try:
+            w, h = (int(v) for v in saved.split("+")[0].split("x"))
+            if w <= self.root.winfo_screenwidth() * 0.95 and h <= self.root.winfo_screenheight() * 0.9:
+                geometry = saved
+        except ValueError:
+            pass
+        self.root.geometry(geometry)
+        if s.get("zoomed"):
+            self.root.state("zoomed")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ оформление
+
+    def _setup_style(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        from tkinter import font as tkfont
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(name).configure(family=FONT, size=10)
+            except tk.TclError:
+                pass
+        # Флажки темы clam мелкие на мониторах с масштабированием: увеличиваем
+        scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        style.configure("TCheckbutton", indicatorsize=int(13 * scale), indicatormargin=(0, 0, 6, 0))
+        style.configure(".", background=COLOR_BG, foreground=COLOR_TEXT, font=(FONT, 10))
+        style.configure("TFrame", background=COLOR_BG)
+        style.configure("Card.TFrame", background=COLOR_CARD)
+        style.configure("Header.TFrame", background=COLOR_HEADER)
+        style.configure("TLabel", background=COLOR_BG)
+        style.configure("Card.TLabel", background=COLOR_CARD)
+        style.configure("CardTitle.TLabel", background=COLOR_CARD, font=(FONT, 11, "bold"))
+        style.configure("Muted.TLabel", background=COLOR_CARD, foreground=COLOR_MUTED, font=(FONT, 9))
+        style.configure("Status.TLabel", background=COLOR_BG, foreground=COLOR_MUTED, font=(FONT, 9))
+        style.configure("HeaderTitle.TLabel", background=COLOR_HEADER, foreground="white",
+                        font=(FONT, 18, "bold"))
+        style.configure("HeaderSub.TLabel", background=COLOR_HEADER, foreground="#C9D4EA",
+                        font=(FONT, 9))
+        style.configure("TCheckbutton", background=COLOR_CARD)
+        style.map("TCheckbutton", background=[("active", COLOR_CARD)])
+        style.configure("TButton", padding=(10, 4))
+        style.configure("Accent.TButton", background=COLOR_ACCENT, foreground="white",
+                        font=(FONT, 11, "bold"), padding=(24, 8), borderwidth=0)
+        style.map("Accent.TButton",
+                  background=[("disabled", "#9AA8C4"), ("active", COLOR_ACCENT_DARK)],
+                  foreground=[("disabled", "#EEF1F7")])
+        style.configure("Link.TButton", background=COLOR_CARD, foreground=COLOR_ACCENT,
+                        borderwidth=0, padding=(4, 2))
+        style.map("Link.TButton", background=[("active", "#EEF2FA")])
+        style.configure("Horizontal.TProgressbar", troughcolor="#E3E7EF",
+                        background=COLOR_ACCENT, bordercolor=COLOR_BORDER,
+                        lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT)
+        style.configure("TEntry", padding=4)
+        style.configure("TCombobox", padding=4)
+
+    def _set_icon(self):
+        """Значок окна: синий лист с строками ведомости (вместо пера Tk)."""
+        try:
+            size = 32
+            img = tk.PhotoImage(width=size, height=size)
+            img.put(COLOR_ACCENT, to=(0, 0, size, size))
+            img.put("#FFFFFF", to=(7, 5, 25, 27))
+            for y in (9, 14, 19):
+                img.put(COLOR_ACCENT, to=(10, y, 22, y + 2))
+            img.put(COLOR_ACCENT, to=(10, 23, 17, 25))
+            self._icon = img
+            self.root.iconphoto(True, img)
+        except tk.TclError:
+            pass
+
+    def _card(self, parent, title=None):
+        """Белая карточка с рамкой и заголовком; возвращает внутреннюю рамку."""
+        outer = tk.Frame(parent, background=COLOR_CARD, highlightthickness=1,
+                         highlightbackground=COLOR_BORDER)
+        outer.pack(fill=tk.X, padx=16, pady=(0, 10))
+        inner = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
+        inner.pack(fill=tk.BOTH, expand=True)
+        if title:
+            ttk.Label(inner, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        return outer, inner
+
+    # ------------------------------------------------------------------ окно
 
     def _on_close(self):
         if self._busy and not messagebox.askyesno(
                 "Экспорт не завершен",
                 "Экспорт еще выполняется. Закрыть программу?"):
             return
+        self._save_settings()
         self.root.destroy()
+
+    def _save_settings(self):
+        zoomed = self.root.state() == "zoomed"
+        if not zoomed:
+            self.settings["geometry"] = self.root.geometry()
+        self.settings.update({
+            "zoomed": zoomed,
+            "show_log": self.show_log.get(),
+            "excel": self.export_excel.get(),
+            "word": self.export_word.get(),
+            "pdf": self.export_pdf.get(),
+            "costs": self.export_costs.get(),
+            "edit_rows": self.edit_before_export.get(),
+            "open_after": self.open_after_export.get(),
+        })
+        save_settings(self.settings)
 
     def _setup_menu(self):
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
 
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Открыть сборку...", accelerator="Ctrl+O",
+                              command=self._browse_file)
+        file_menu.add_command(label="Взять активную сборку из КОМПАС", accelerator="Ctrl+K",
+                              command=self._take_from_kompas)
+        self.recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Последние файлы", menu=self.recent_menu)
+        file_menu.add_separator()
+        file_menu.add_command(label="Сформировать ведомость", accelerator="F5",
+                              command=self._export)
+        file_menu.add_command(label="Открыть папку сборки", command=self._open_assembly_folder)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self._on_close)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+
         view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_checkbutton(label="Последние файлы", variable=self.show_recent,
-                                  command=self._rebuild_panels)
-        view_menu.add_checkbutton(label="Лог", variable=self.show_log,
+        view_menu.add_checkbutton(label="Журнал", variable=self.show_log, accelerator="Ctrl+L",
                                   command=self._rebuild_panels)
         menubar.add_cascade(label="Вид", menu=view_menu)
 
         settings_menu = tk.Menu(menubar, tearoff=0)
-        settings_menu.add_command(label="Ввести лицензию", command=self._show_license_dialog)
-        settings_menu.add_command(label="Мой ID компьютера", command=self._show_machine_id)
-        settings_menu.add_separator()
         settings_menu.add_command(label="Шаблоны...", command=self._show_template_dialog)
         settings_menu.add_command(label="Цены и калькулятор...", command=self._show_prices_dialog)
         settings_menu.add_separator()
-        settings_menu.add_command(label="Выход", command=self.root.quit)
+        settings_menu.add_command(label="Ввести лицензию", command=self._show_license_dialog)
+        settings_menu.add_command(label="Мой ID компьютера", command=self._show_machine_id)
         menubar.add_cascade(label="Настройки", menu=settings_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Горячие клавиши", command=self._show_shortcuts)
         help_menu.add_command(label="О программе", command=self._show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
 
+    def _setup_shortcuts(self):
+        self.root.bind("<Control-o>", lambda e: self._browse_file())
+        self.root.bind("<Control-O>", lambda e: self._browse_file())
+        self.root.bind("<Control-k>", lambda e: self._take_from_kompas())
+        self.root.bind("<Control-K>", lambda e: self._take_from_kompas())
+        self.root.bind("<F5>", lambda e: self._export())
+        self.root.bind("<Control-Return>", lambda e: self._export())
+        self.root.bind("<Control-l>", lambda e: self._toggle_log())
+        self.root.bind("<Control-L>", lambda e: self._toggle_log())
+
     def _setup_ui(self):
-        # --- Заголовок ---
-        header_frame = ttk.Frame(self.root)
-        header_frame.pack(fill=tk.X, padx=20, pady=(10, 0))
-
-        left_header = ttk.Frame(header_frame)
-        left_header.pack(side=tk.LEFT)
-
-        ttk.Label(left_header, text=self.APP_NAME, font=("Arial", 18, "bold")).pack(anchor="w")
-        ttk.Label(left_header, text="Экспорт сводной ведомости из КОМПАС-3D",
-                  font=("Arial", 9), foreground="gray").pack(anchor="w")
-
-        self.status_label = ttk.Label(header_frame, text="", font=("Arial", 9))
+        # --- Шапка ---
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(18, 12))
+        header.pack(fill=tk.X)
+        left = ttk.Frame(header, style="Header.TFrame")
+        left.pack(side=tk.LEFT)
+        ttk.Label(left, text=self.APP_NAME, style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(left, text=f"Сводная ведомость из КОМПАС-3D  ·  версия {self.VERSION}",
+                  style="HeaderSub.TLabel").pack(anchor="w")
+        self.status_label = tk.Label(header, text="", font=(FONT, 9, "bold"),
+                                     foreground="white", background=COLOR_OK, padx=10, pady=3,
+                                     cursor="hand2")
         self.status_label.pack(side=tk.RIGHT)
+        self.status_label.bind("<Button-1>", lambda e: self._show_license_dialog())
+        Tooltip(self.status_label, "Состояние лицензии. Нажмите, чтобы ввести ключ.")
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=20, pady=8)
+        body = ttk.Frame(self.root, padding=(0, 12, 0, 0))
+        body.pack(fill=tk.BOTH, expand=True)
+        self.body = body
 
-        # --- Файл сборки ---
-        file_frame = ttk.LabelFrame(self.root, text="Файл сборки", padding=10)
-        file_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
-
-        file_row = ttk.Frame(file_frame)
-        file_row.pack(fill=tk.X)
-
+        # --- Сборка ---
+        _, card = self._card(body, "Сборка")
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill=tk.X)
         self.file_var = tk.StringVar()
-        self.file_entry = ttk.Entry(file_row, textvariable=self.file_var, font=("Consolas", 10))
-        self.file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.file_combo = ttk.Combobox(row, textvariable=self.file_var, font=(FONT, 10))
+        self.file_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        Tooltip(self.file_combo, "Путь к файлу сборки .a3d. Раскройте список, "
+                                 "чтобы выбрать один из последних файлов.")
+        btn = ttk.Button(row, text="Обзор...", command=self._browse_file)
+        btn.pack(side=tk.LEFT, padx=(0, 6))
+        Tooltip(btn, "Выбрать файл сборки (Ctrl+O)")
+        btn = ttk.Button(row, text="Из КОМПАС", command=self._take_from_kompas)
+        btn.pack(side=tk.LEFT)
+        Tooltip(btn, "Взять сборку, открытую сейчас в КОМПАС-3D (Ctrl+K)")
+        hint = ("Можно перетащить файл .a3d в окно. " if self._dnd_available else "") + \
+            "Документы сохраняются в папку сборки."
+        ttk.Label(card, text=hint, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
 
-        ttk.Button(file_row, text="Обзор...", command=self._browse_file).pack(side=tk.RIGHT)
+        # --- Что сформировать ---
+        _, card = self._card(body, "Что сформировать")
+        grid = ttk.Frame(card, style="Card.TFrame")
+        grid.pack(fill=tk.X)
+        ttk.Label(grid, text="Форматы:", style="Card.TLabel").grid(row=0, column=0, sticky="w",
+                                                                  padx=(0, 12), pady=2)
+        for col, (text, var, tip) in enumerate((
+                ("Excel", self.export_excel, "Ведомость в Excel (.xlsx)"),
+                ("Word", self.export_word, "Ведомость в Word (.docx)"),
+                ("PDF", self.export_pdf, "Ведомость в PDF"),
+        ), start=1):
+            cb = ttk.Checkbutton(grid, text=text, variable=var)
+            cb.grid(row=0, column=col, sticky="w", padx=(0, 14), pady=2)
+            Tooltip(cb, tip)
+        ttk.Label(grid, text="Дополнительно:", style="Card.TLabel").grid(row=1, column=0, sticky="w",
+                                                                        padx=(0, 12), pady=2)
+        for col, (text, var, tip) in enumerate((
+                ("Расчет стоимости", self.export_costs,
+                 "Добавить в Excel лист со стоимостью материалов и работ "
+                 "(цены: Настройки → Цены и калькулятор)"),
+                ("Проверить строки перед сохранением", self.edit_before_export,
+                 "Открыть редактор строк: можно исключить строки, поправить гибку и длину"),
+        ), start=1):
+            cb = ttk.Checkbutton(grid, text=text, variable=var)
+            cb.grid(row=1, column=col, columnspan=2 if col == 2 else 1, sticky="w",
+                    padx=(0, 14), pady=2)
+            Tooltip(cb, tip)
+        cb = ttk.Checkbutton(grid, text="Открыть файл после экспорта", variable=self.open_after_export)
+        cb.grid(row=2, column=1, columnspan=3, sticky="w", pady=2)
+        tmpl_row = ttk.Frame(card, style="Card.TFrame")
+        tmpl_row.pack(fill=tk.X, pady=(6, 0))
+        self.template_label = ttk.Label(tmpl_row, text="", style="Muted.TLabel")
+        self.template_label.pack(side=tk.LEFT)
+        ttk.Button(tmpl_row, text="Изменить шаблон", style="Link.TButton",
+                   command=self._show_template_dialog).pack(side=tk.LEFT, padx=(6, 0))
+        self._set_template_label(self._template_name)
 
-        if self._dnd_available:
-            ttk.Label(file_frame, text="или перетащите .a3d файл в окно",
-                      font=("Arial", 8), foreground="gray").pack(anchor="w", pady=(5, 0))
+        # --- Запуск и прогресс ---
+        action = ttk.Frame(body, padding=(16, 0, 16, 10))
+        action.pack(fill=tk.X)
+        self.export_btn = ttk.Button(action, text="Сформировать ведомость",
+                                     style="Accent.TButton", command=self._export)
+        self.export_btn.pack(side=tk.LEFT)
+        Tooltip(self.export_btn, "Прочитать сборку из КОМПАС и сохранить документы (F5)")
+        prog = ttk.Frame(action)
+        prog.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(16, 0))
+        self.stage_var = tk.StringVar(value="Готово к работе")
+        ttk.Label(prog, textvariable=self.stage_var, style="Status.TLabel").pack(anchor="w")
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100)
+        self.progress.pack(fill=tk.X, pady=(3, 0))
 
-        # --- Форматы экспорта ---
-        fmt_frame = ttk.Frame(self.root)
-        fmt_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
+        # --- Результат (появляется после экспорта) ---
+        self.result_outer, self.result_card = self._card(body, None)
+        self.result_outer.pack_forget()
+        self.result_title = ttk.Label(self.result_card, text="", style="CardTitle.TLabel")
+        self.result_title.pack(anchor="w")
+        self.result_text = ttk.Label(self.result_card, text="", style="Muted.TLabel",
+                                     justify=tk.LEFT, wraplength=680)
+        self.result_text.pack(anchor="w", pady=(2, 6))
+        self.result_buttons = ttk.Frame(self.result_card, style="Card.TFrame")
+        self.result_buttons.pack(fill=tk.X)
 
-        ttk.Label(fmt_frame, text="Форматы:", font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(fmt_frame, text="Excel", variable=self.export_excel).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(fmt_frame, text="Word", variable=self.export_word).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(fmt_frame, text="PDF", variable=self.export_pdf).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(fmt_frame, text="Стоимость", variable=self.export_costs).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(fmt_frame, text="Редактировать строки",
-                        variable=self.edit_before_export).pack(side=tk.LEFT, padx=8)
-
-        # --- Кнопка ЭКСПОРТ + Спиннер ---
-        action_frame = ttk.Frame(self.root)
-        action_frame.pack(pady=8)
-
-        self.export_btn = tk.Button(
-            action_frame,
-            text="  ЭКСПОРТ  ",
-            command=self._export,
-            font=("Arial", 11, "bold"),
-            bg="#2F5496",
-            fg="white",
-            activebackground="#1F3D7A",
-            activeforeground="white",
-            relief="flat",
-            cursor="hand2",
-            padx=30,
-            pady=6,
-        )
-        self.export_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.spinner_label = ttk.Label(action_frame, text="", font=("Consolas", 14), width=2)
-        self.spinner_label.pack(side=tk.LEFT)
-
-        # --- Последние файлы (скрыт по умолчанию) ---
-        self.recent_frame = ttk.LabelFrame(self.root, text="Последние файлы", padding=5)
-
-        list_frame = ttk.Frame(self.recent_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(list_frame)
+        # --- Журнал ---
+        self.log_frame = ttk.Frame(body, padding=(16, 0, 16, 6))
+        log_box = tk.Frame(self.log_frame, background=COLOR_CARD, highlightthickness=1,
+                           highlightbackground=COLOR_BORDER)
+        log_box.pack(fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(log_box)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text = tk.Text(log_box, height=6, state=tk.DISABLED, font=("Consolas", 9),
+                                relief="flat", background=COLOR_CARD, foreground=COLOR_TEXT,
+                                yscrollcommand=scrollbar.set, padx=8, pady=6)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.log_text.yview)
+        self.log_text.tag_configure("err", foreground=COLOR_ERR)
+        self.log_text.tag_configure("warn", foreground=COLOR_WARN)
+        self.log_text.tag_configure("ok", foreground=COLOR_OK)
 
-        self.recent_listbox = tk.Listbox(list_frame, height=3, font=("Consolas", 9),
-                                          yscrollcommand=scrollbar.set)
-        self.recent_listbox.pack(fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.recent_listbox.yview)
-        self.recent_listbox.bind("<Double-Button-1>", self._on_recent_double_click)
+        # --- Строка состояния ---
+        status = ttk.Frame(self.root, padding=(16, 4))
+        status.pack(fill=tk.X, side=tk.BOTTOM, before=body)
+        self.log_toggle = ttk.Button(status, text="", command=self._toggle_log)
+        self.log_toggle.pack(side=tk.LEFT)
+        ttk.Label(status, text="F5 — сформировать   Ctrl+O — открыть   Ctrl+K — из КОМПАС",
+                  style="Status.TLabel").pack(side=tk.RIGHT)
 
-        recent_btn_frame = ttk.Frame(self.recent_frame)
-        recent_btn_frame.pack(fill=tk.X, pady=(5, 0))
+    def _set_template_label(self, name):
+        self._template_name = name
+        self.template_label.config(text=f"Шаблон столбцов: {name}")
 
-        ttk.Button(recent_btn_frame, text="Открыть", command=self._open_recent).pack(side=tk.LEFT, padx=2)
-        ttk.Button(recent_btn_frame, text="Удалить", command=self._remove_recent).pack(side=tk.LEFT, padx=2)
-        ttk.Button(recent_btn_frame, text="Очистить", command=self._clear_recent).pack(side=tk.LEFT, padx=2)
-
-        # --- Лог (скрыт по умолчанию) ---
-        self.log_frame = ttk.LabelFrame(self.root, text="Лог", padding=5)
-
-        self.log_text = tk.Text(self.log_frame, height=4, state=tk.DISABLED, font=("Consolas", 9))
-        self.log_text.pack(fill=tk.X)
+    def _toggle_log(self):
+        self.show_log.set(not self.show_log.get())
+        self._rebuild_panels()
 
     def _rebuild_panels(self):
-        """Пересборка сворачиваемых секций."""
-        self.recent_frame.pack_forget()
         self.log_frame.pack_forget()
-
-        if self.show_recent.get():
-            self.recent_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 5))
         if self.show_log.get():
-            self.log_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
-
-        self.root.update_idletasks()
-        self.root.geometry("")
+            self.log_frame.pack(fill=tk.BOTH, expand=True)
+        self.log_toggle.config(text=("Скрыть журнал" if self.show_log.get() else "Показать журнал"))
 
     def _show_about(self):
         messagebox.showinfo("О программе",
-            f"{self.APP_NAME} v{self.VERSION}\n\n"
-            "Экспорт сводной ведомости из КОМПАС-3D v24\n"
-            "в форматы Excel, Word и PDF.\n\n"
+            f"{self.APP_NAME} {self.VERSION}\n\n"
+            "Сводная ведомость из сборки КОМПАС-3D v24\n"
+            "в Excel, Word и PDF: позиции, количество, масса,\n"
+            "материал, длина сортамента, гибка.\n\n"
             "GitHub: github.com/Djonros/Svodnik")
+
+    def _show_shortcuts(self):
+        messagebox.showinfo("Горячие клавиши",
+            "F5 или Ctrl+Enter — сформировать ведомость\n"
+            "Ctrl+O — открыть файл сборки\n"
+            "Ctrl+K — взять активную сборку из КОМПАС\n"
+            "Ctrl+L — показать или скрыть журнал")
 
     def _setup_dragdrop(self):
         if not self._dnd_available:
@@ -275,91 +536,113 @@ class KompasExportApp:
 
     def _update_status(self):
         status = self.license.get_status()
-        self.status_label.config(text=status)
-        if not self.license.is_valid():
-            self.status_label.config(foreground="red")
-        else:
-            self.status_label.config(foreground="green")
+        color = COLOR_OK if self.license.is_valid() else COLOR_ERR
+        if self.license.is_valid() and "проб" in status.lower():
+            color = COLOR_WARN
+        self.status_label.config(text=status, background=color)
+
+    # ------------------------------------------------------------------ файлы
 
     def _load_recent_list(self):
-        self.recent_listbox.delete(0, tk.END)
-        for filepath in load_recent():
-            display = filepath
-            if len(display) > 60:
-                display = "..." + display[-57:]
-            self.recent_listbox.insert(tk.END, display)
-
-    def _browse_file(self):
-        filepath = filedialog.askopenfilename(
-            title="Выберите файл сборки",
-            filetypes=[("Файлы КОМПАС", "*.a3d *.a3t"), ("Все файлы", "*.*")]
-        )
-        if filepath:
-            self.file_var.set(filepath)
-
-    def _on_recent_double_click(self, event):
-        self._open_recent()
-
-    def _open_recent(self):
-        selection = self.recent_listbox.curselection()
-        if not selection:
-            return
         files = load_recent()
-        idx = selection[0]
-        if idx < len(files):
-            filepath = files[idx]
-            if os.path.exists(filepath):
-                self.file_var.set(filepath)
-            else:
-                messagebox.showwarning("Внимание", f"Файл не найден:\n{filepath}")
-                files.pop(idx)
-                save_recent(files)
-                self._load_recent_list()
-
-    def _remove_recent(self):
-        selection = self.recent_listbox.curselection()
-        if not selection:
+        self.file_combo["values"] = files
+        self.recent_menu.delete(0, tk.END)
+        if not files:
+            self.recent_menu.add_command(label="(пусто)", state="disabled")
             return
-        files = load_recent()
-        idx = selection[0]
-        if idx < len(files):
-            files.pop(idx)
-            save_recent(files)
-            self._load_recent_list()
+        for path in files:
+            label = path if len(path) <= 70 else "..." + path[-67:]
+            self.recent_menu.add_command(label=label, command=lambda p=path: self._select_recent(p))
+        self.recent_menu.add_separator()
+        self.recent_menu.add_command(label="Очистить список", command=self._clear_recent)
+        if not self.file_var.get():
+            self.file_var.set(files[0])
+
+    def _select_recent(self, path):
+        if os.path.exists(path):
+            self.file_var.set(path)
+            return
+        messagebox.showwarning("Внимание", f"Файл не найден:\n{path}")
+        files = [f for f in load_recent() if f != path]
+        save_recent(files)
+        self._load_recent_list()
 
     def _clear_recent(self):
         if messagebox.askyesno("Очистка", "Очистить список последних файлов?"):
             save_recent([])
             self._load_recent_list()
 
-    def _start_spinner(self):
-        self._spinner_running = True
-        self._animate_spinner()
+    def _browse_file(self):
+        current = self.file_var.get()
+        filepath = filedialog.askopenfilename(
+            title="Выберите файл сборки",
+            initialdir=os.path.dirname(current) if current else None,
+            filetypes=[("Сборки КОМПАС", "*.a3d *.a3t"), ("Все файлы", "*.*")]
+        )
+        if filepath:
+            self.file_var.set(os.path.normpath(filepath))
 
-    def _stop_spinner(self):
-        self._spinner_running = False
-        self.spinner_label.config(text="")
-
-    def _animate_spinner(self):
-        if not self._spinner_running:
+    def _take_from_kompas(self):
+        """Путь к сборке, открытой сейчас в КОМПАС-3D."""
+        try:
+            import pythoncom
+            import win32com.client
+            pythoncom.CoInitialize()
+            app = win32com.client.GetActiveObject("Kompas.Application.7")
+            doc = app.ActiveDocument
+            path = doc.PathName if doc else ""
+        except Exception:
+            messagebox.showwarning("КОМПАС", "КОМПАС-3D не запущен или в нем нет открытого документа.")
             return
-        frame = next(self._spinner_cycle)
-        self.spinner_label.config(text=frame)
-        self.root.after(80, self._animate_spinner)
+        if not path:
+            messagebox.showwarning("КОМПАС", "Активный документ КОМПАС еще не сохранен в файл.")
+        elif not path.lower().endswith((".a3d", ".a3t")):
+            messagebox.showwarning("КОМПАС", f"Активный документ не сборка:\n{os.path.basename(path)}")
+        else:
+            self.file_var.set(os.path.normpath(path))
+
+    def _open_assembly_folder(self):
+        path = self.file_var.get()
+        folder = os.path.dirname(path) if path else ""
+        if folder and os.path.isdir(folder):
+            open_path(folder)
+        else:
+            messagebox.showwarning("Внимание", "Сначала выберите файл сборки.")
+
+    # ------------------------------------------------------------------ журнал и прогресс
 
     def _log(self, message):
-        if not self.show_log.get():
-            self.show_log.set(True)
-            self._rebuild_panels()
+        tag = ""
+        head = message.lstrip()
+        if head.startswith(("[!!]", "Ошибка")):
+            tag = "err"
+        elif head.startswith(("[??]", "Внимание")):
+            tag = "warn"
+        elif head.startswith("[OK]"):
+            tag = "ok"
         self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} {message}\n")
+        self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')}  {message}\n", tag)
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
+        self._track_stage(message)
 
     def _log_output(self, output):
         for line in output.strip().split("\n"):
             if line.strip():
                 self._log(line)
+
+    def _set_stage(self, text, value=None):
+        self.stage_var.set(text)
+        if value is not None:
+            self.progress["value"] = value
+
+    def _track_stage(self, message):
+        if not self._busy:
+            return
+        for marker, text, value in STAGES:
+            if marker in message and value >= self.progress["value"]:
+                self._set_stage(text, value)
+                break
 
     def _run_in_background(self, job, on_done):
         """Выполнение job в фоновом потоке, чтобы окно не зависало.
@@ -397,7 +680,11 @@ class KompasExportApp:
 
         poll()
 
+    # ------------------------------------------------------------------ экспорт
+
     def _export(self):
+        if self._busy:
+            return
         if not self.license.is_valid():
             remaining = self.license.MAX_EXPORTS_TRIAL - self.license.exports_count
             if remaining > 0:
@@ -408,13 +695,12 @@ class KompasExportApp:
                     "Пробный период закончился!\nВведите лицензионный ключ.")
             return
 
-        filepath = self.file_var.get()
+        filepath = self.file_var.get().strip().strip('"')
         if not filepath:
-            messagebox.showwarning("Внимание", "Выберите файл сборки!")
+            messagebox.showwarning("Внимание", "Выберите файл сборки: «Обзор...» или «Из КОМПАС».")
             return
-
         if not os.path.exists(filepath):
-            messagebox.showerror("Ошибка", "Файл не найден!")
+            messagebox.showerror("Ошибка", f"Файл не найден:\n{filepath}")
             return
 
         formats = set()
@@ -425,14 +711,16 @@ class KompasExportApp:
         if self.export_pdf.get():
             formats.add("pdf")
         if not formats:
-            messagebox.showwarning("Внимание", "Выберите хотя бы один формат!")
+            messagebox.showwarning("Внимание", "Отметьте хотя бы один формат: Excel, Word или PDF.")
             return
 
+        self._save_settings()
         self.export_btn.config(state="disabled")
         self._busy = True
-        self._start_spinner()
+        self.result_outer.pack_forget()
+        self._set_stage("Подключение к КОМПАС...", 5)
         fmt_list = ", ".join(sorted(formats)).upper()
-        self._log(f"Начало экспорта ({fmt_list})...")
+        self._log(f"Начало экспорта ({fmt_list}): {filepath}")
 
         self._export_ctx = {
             "exporter": KompasExportFinal(template=self._current_template),
@@ -458,20 +746,23 @@ class KompasExportApp:
     def _after_analyze(self, ok, error):
         if error is None and not ok:
             error = RuntimeError("Не удалось подключиться к КОМПАС "
-                                 "или открыть сборку (см. лог выше)")
+                                 "или открыть сборку (подробности в журнале)")
         if error is not None:
             self._finish_export(error)
             return
 
         if self.edit_before_export.get():
+            self._set_stage("Проверка строк в редакторе...")
             from row_editor import RowEditorDialog
             editor = RowEditorDialog(self.root, self._export_ctx["exporter"].all_data)
             self.root.wait_window(editor)
             if not editor.applied:
                 self._log("Экспорт отменен в редакторе строк")
                 self._finish_export()
+                self._set_stage("Экспорт отменен", 0)
                 return
 
+        self._set_stage("Формирование документов...", 75)
         self._run_in_background(self._generate_job, self._after_generate)
 
     def _generate_job(self):
@@ -493,40 +784,110 @@ class KompasExportApp:
         self.license.record_export()
         self._update_status()
 
-        self._log("Экспорт завершен успешно!")
+        self._log("[OK] Экспорт завершен")
         self._finish_export()
+        self._set_stage("Готово", 100)
+        self._show_result(exporter, result or {})
 
-        message = "Экспорт завершен!\nФайлы сохранены в папке сборки."
-        generated = getattr(exporter, "generated_specs", [])
+        if self.open_after_export.get() and result:
+            first = result.get("excel") or next(iter(result.values()), None)
+            if first and os.path.exists(first):
+                open_path(first)
+
+    def _show_result(self, exporter, results):
+        """Карточка с итогом: файлы, кнопки открытия, проблемы."""
+        self._last_results = results
+        problems = list(exporter.problems)
+        warnings = list(exporter.quantity_warnings)
+        generated = list(getattr(exporter, "generated_specs", []))
+        parts = [it for it in exporter.all_data if not it.get("is_assembly")]
+        bent = sum(1 for it in parts if it.get("is_bending"))
+
+        issues = []
+        if problems:
+            issues.append(("Ошибки чтения из КОМПАС, ведомость может быть неполной", problems))
+        if warnings:
+            issues.append(("Количество в модели не совпадает со спецификацией", warnings))
         if generated:
-            names = "\n".join(os.path.basename(p) for p in generated[:8])
-            more = f"\n... и еще {len(generated) - 8}" if len(generated) > 8 else ""
-            message += (f"\n\nСпецификаций не было, созданы автоматически "
-                        f"в папке \"Генерированные спецификации\" ({len(generated)}):\n{names}{more}")
-            self._log(f"Создано спецификаций: {len(generated)}")
-        sections = []
-        for title, items in (
-            ("Ошибки чтения из КОМПАС, ведомость может быть неполной", exporter.problems),
-            ("Количество в модели не совпадает со спецификацией", exporter.quantity_warnings),
-        ):
-            if items:
-                shown = "\n".join(items[:8])
-                more = f"\n... и еще {len(items) - 8} (см. лог)" if len(items) > 8 else ""
-                sections.append(f"{title} ({len(items)}):\n{shown}{more}")
-        if sections:
-            self._log(f"Внимание: проблем {len(exporter.problems)}, "
-                      f"расхождений количества {len(exporter.quantity_warnings)}")
-            messagebox.showwarning("Готово, проверьте ведомость",
-                                   message + "\n\n" + "\n\n".join(sections))
+            issues.append(("Спецификации не было, созданы автоматически "
+                           "(папка «Генерированные спецификации»)",
+                           [os.path.basename(p) for p in generated]))
+        self._last_issues = issues
+
+        n_bad = len(problems) + len(warnings)
+        if n_bad:
+            self.result_title.config(text=f"Готово, проверьте ведомость: замечаний {n_bad}",
+                                     foreground=COLOR_WARN)
         else:
-            messagebox.showinfo("Готово", message)
+            self.result_title.config(text="Готово", foreground=COLOR_OK)
+        lines = [f"Деталей и сборок: {len(exporter.all_data)}, из них гнутых деталей: {bent}."]
+        if generated:
+            lines.append(f"Создано спецификаций: {len(generated)}.")
+        lines.append("Сохранено: " + ", ".join(os.path.basename(p) for p in results.values()))
+        self.result_text.config(text="\n".join(lines))
+
+        for w in self.result_buttons.winfo_children():
+            w.destroy()
+        names = {"excel": "Открыть Excel", "word": "Открыть Word", "pdf": "Открыть PDF"}
+        for fmt in ("excel", "word", "pdf"):
+            path = results.get(fmt)
+            if path:
+                ttk.Button(self.result_buttons, text=names[fmt],
+                           command=lambda p=path: open_path(p)).pack(side=tk.LEFT, padx=(0, 6))
+        folder = os.path.dirname(next(iter(results.values()), "") or "")
+        if folder:
+            ttk.Button(self.result_buttons, text="Открыть папку",
+                       command=lambda: open_path(folder)).pack(side=tk.LEFT, padx=(0, 6))
+        if issues:
+            ttk.Button(self.result_buttons, text=f"Замечания ({n_bad + len(generated)})",
+                       command=self._show_issues).pack(side=tk.LEFT, padx=(0, 6))
+        if self.log_frame.winfo_manager():
+            self.result_outer.pack(fill=tk.X, padx=16, pady=(0, 10), before=self.log_frame)
+        else:
+            self.result_outer.pack(fill=tk.X, padx=16, pady=(0, 10))
+        if n_bad:
+            self._show_issues()
+
+    def _show_issues(self):
+        """Окно со всеми замечаниями экспорта (с прокруткой и копированием)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Замечания по ведомости")
+        dialog.geometry("720x420")
+        dialog.configure(background=COLOR_BG)
+        dialog.transient(self.root)
+        box = tk.Frame(dialog, background=COLOR_CARD, highlightthickness=1,
+                       highlightbackground=COLOR_BORDER)
+        box.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 6))
+        sb = ttk.Scrollbar(box)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        text = tk.Text(box, wrap="word", relief="flat", background=COLOR_CARD,
+                       font=(FONT, 10), padx=10, pady=8, yscrollcommand=sb.set)
+        text.pack(fill=tk.BOTH, expand=True)
+        sb.config(command=text.yview)
+        text.tag_configure("h", font=(FONT, 10, "bold"), spacing1=6, spacing3=4)
+        for title, items in self._last_issues:
+            text.insert(tk.END, f"{title} ({len(items)})\n", "h")
+            for item in items:
+                text.insert(tk.END, f"•  {item}\n")
+        text.config(state=tk.DISABLED)
+
+        def copy_all():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text.get("1.0", tk.END))
+
+        btns = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Закрыть", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Копировать", command=copy_all).pack(side=tk.RIGHT, padx=6)
 
     def _finish_export(self, error=None):
-        self._stop_spinner()
         self.export_btn.config(state="normal")
         self._busy = False
         if error is not None:
+            self._set_stage("Ошибка, подробности в журнале", 0)
             self._log(f"Ошибка: {error}")
+            if not self.show_log.get():
+                self._toggle_log()
             messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{error}")
 
     def _show_machine_id(self):
@@ -626,6 +987,7 @@ class KompasExportApp:
                 return
             name = self._template_names[sel[0]]
             self._current_template = templates[name]["data"]
+            self._set_template_label(name)
             self._log(f"Шаблон: {name}")
             dialog.destroy()
 
