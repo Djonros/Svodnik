@@ -65,6 +65,7 @@ class KompasExportFinal:
         self.model_counts = {}
         self.quantity_warnings = []
         self.problems = []
+        self.bend_cache = {}
         self.opened_docs = []
         self.template = template or self._default_template()
         if template:
@@ -268,7 +269,7 @@ class KompasExportFinal:
                               f"компонент учтен как деталь: {e}")
 
             info["is_bending"] = (
-                self._check_unfold(p7) if not info["is_assembly"] else False
+                self._is_bent(p7, info["material"]) if not info["is_assembly"] else False
             )
 
             self.all_data.append(info)
@@ -282,39 +283,128 @@ class KompasExportFinal:
         if parent_marking:
             self.model_counts[parent_marking] = counts
 
-    def _check_unfold(self, p7):
-        """Статус развертки: True, только если у детали есть листовое тело
-        и оно разогнуто (ISheetMetalBody.Straighten). Никаких предположений
-        по названию или толщине не делается."""
+    # Операции листового тела, которые дают гиб
+    SHEET_BEND_COLLECTIONS = (
+        "SheetMetalBends", "SheetMetalLineBends", "SheetMetalSketchBends",
+        "SheetMetalFlangings", "SheetMetalShoulders", "SheetMetalRuledShells",
+        "SheetMetalLinearRuledShells", "SheetMetalBendedStraightens",
+    )
+    # Материалы из листа и полосы: для них ищем гибы по геометрии
+    SHEET_MATERIAL_RE = re.compile(r"лист|полос", re.IGNORECASE)
+    TUBE_MATERIAL_RE = re.compile(r"труб|круг|пруток", re.IGNORECASE)
+    # Толщина из обозначения материала: "Лист$d5 ...", "Лист$dБ-ПН-О-12 ...", "Полоса 4х40"
+    THICKNESS_RE = re.compile(r"(?:лист|полос\w*)\D{0,15}?(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+    def _is_bent(self, p7, material=""):
+        """Гнутая деталь или нет. Результат кэшируется по файлу детали.
+        Признаки (любой):
+        1. В детали есть листовые операции сгиба (сгиб, сгиб по линии, буртик,
+           подсечка, обечайка и т.п.) или листовое тело разогнуто.
+        2. Деталь из листа/полосы, и в ней есть пара соосных цилиндрических
+           граней с одинаковым углом, радиусы которых отличаются на толщину
+           листа (внутренний и наружный радиус гиба) - так находятся гибы
+           у деталей, построенных обычным выдавливанием.
+        3. Деталь из трубы или круга, и в ней есть тороидальные грани (гнутая труба)."""
+        try:
+            key = (p7.FileName or "").lower()
+        except Exception:
+            key = ""
+        if key and key in self.bend_cache:
+            return self.bend_cache[key]
+
+        bent = self._sheet_metal_bent(p7)
+        if not bent:
+            bent = self._geometry_bent(p7, material)
+        if key:
+            self.bend_cache[key] = bent
+        return bent
+
+    def _sheet_metal_bent(self, p7):
         try:
             container = win32com.client.CastTo(p7, "ISheetMetalContainer")
-            bodies = container.SheetMetalBodies
-        except Exception:
-            try:
-                bodies = p7.SheetMetalBodies
-            except Exception:
-                return False
-
-        try:
-            count = bodies.Count
         except Exception:
             return False
-
-        for i in range(count):
+        for name in self.SHEET_BEND_COLLECTIONS:
             try:
-                body = bodies.SheetMetalBody(i)
-            except Exception:
-                try:
-                    body = bodies.Item(i)
-                except Exception:
-                    continue
-            if body is None:
-                continue
-            try:
-                if bool(body.Straighten):
+                if getattr(container, name).Count > 0:
                     return True
             except Exception:
                 pass
+        try:
+            bodies = container.SheetMetalBodies
+            for i in range(bodies.Count):
+                if bool(bodies.SheetMetalBody(i).Straighten):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _sheet_thickness(self, p7, material):
+        try:
+            bodies = win32com.client.CastTo(p7, "ISheetMetalContainer").SheetMetalBodies
+            if bodies.Count > 0:
+                return float(bodies.SheetMetalBody(0).Thickness)
+        except Exception:
+            pass
+        m = self.THICKNESS_RE.search(material or "")
+        if m:
+            return float(m.group(1).replace(",", "."))
+        return None
+
+    def _geometry_bent(self, p7, material):
+        is_sheet = bool(self.SHEET_MATERIAL_RE.search(material or ""))
+        is_tube = bool(self.TUBE_MATERIAL_RE.search(material or ""))
+        try:
+            is_sheet = is_sheet or win32com.client.CastTo(
+                p7, "ISheetMetalContainer").SheetMetalBodies.Count > 0
+        except Exception:
+            pass
+        if not (is_sheet or is_tube):
+            return False
+        try:
+            faces = win32com.client.CastTo(p7, "IFeature7").ModelObjects(6) or ()  # o3d_face
+        except Exception:
+            return False
+
+        thickness = self._sheet_thickness(p7, material) if is_sheet else None
+        arcs = []  # (радиус, угол, длина вдоль оси, ось)
+        for f in faces:
+            try:
+                f = win32com.client.CastTo(f, "IFace")
+                if is_tube and f.IsTorus:
+                    return True
+                if not (is_sheet and f.IsCylinder):
+                    continue
+                ms = f.MathSurface
+                angle = ms.ParamUMax - ms.ParamUMin
+                # Отверстия и полуцилиндры (180 и больше) гибами не считаем
+                if angle <= 0 or angle >= 3.13:
+                    continue
+                radius = f.Radius
+                if radius <= 0:
+                    continue
+                length = f.GetArea(0) * 100.0 / (radius * angle)  # GetArea в см2
+                axis = tuple(round(abs(v), 2) for v in ms.Placement.GetVector(2)[1:4])
+                arcs.append((radius, angle, length, axis))
+            except Exception:
+                continue
+
+        for i, (r1, a1, l1, ax1) in enumerate(arcs):
+            for r2, a2, l2, ax2 in arcs[i + 1:]:
+                dr = abs(r1 - r2)
+                if dr < 0.3 or abs(a1 - a2) > 0.02 or ax1 != ax2:
+                    continue
+                if abs(l1 - l2) > 0.05 * max(l1, l2) + 0.5:
+                    continue
+                if thickness:
+                    if abs(dr - thickness) > 0.15 * thickness + 0.05:
+                        continue
+                    # Скругления углов контура имеют длину, равную толщине
+                    if min(l1, l2) < 1.5 * thickness:
+                        continue
+                elif min(l1, l2) < 2 * dr:
+                    continue
+                return True
         return False
 
     def read_positions(self):
