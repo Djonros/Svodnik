@@ -1,7 +1,7 @@
 """
 Проверка и установка обновлений Сводника.
 
-Новые версии выкладываются как релизы GitHub в открытом репозитории
+Новые версии выкладываются как релизы GitHub в репозитории
 RELEASES_REPO: тег вида v1.7.2, описание релиза = список изменений,
 вложение Svodnik.exe.
 """
@@ -13,7 +13,7 @@ import sys
 import tempfile
 import urllib.request
 
-RELEASES_REPO = "Djonros/Svodnik-releases"
+RELEASES_REPO = "Djonros/Svodnik"
 API_LATEST = f"https://api.github.com/repos/{RELEASES_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{RELEASES_REPO}/releases"
 ASSET_NAME = "Svodnik.exe"

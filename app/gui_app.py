@@ -159,7 +159,7 @@ class Tooltip:
 
 class KompasExportApp:
 
-    VERSION = "1.8.0"
+    VERSION = "1.9.0"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -699,7 +699,7 @@ class KompasExportApp:
     def _update_status(self):
         status = self.license.get_status()
         color = COLOR_OK if self.license.is_valid() else COLOR_ERR
-        if self.license.is_valid() and "проб" in status.lower():
+        if self.license.is_valid() and ("проб" in status.lower() or self.license.old_key):
             color = COLOR_WARN
         self.status_label.config(text=status, background=color)
 
@@ -1080,29 +1080,66 @@ class KompasExportApp:
     def _show_license_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Активация лицензии")
-        dialog.geometry("420x200")
+        dialog.configure(background=COLOR_BG)
         dialog.transient(self.root)
+        dialog.resizable(False, False)
         dialog.grab_set()
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(dialog, text="Введите лицензионный ключ:", font=("Arial", 10)).pack(pady=(15, 5))
+        machine_id = self.license.get_machine_id()
+        ttk.Label(body, text="ID этого компьютера:").pack(anchor="w")
+        id_row = ttk.Frame(body)
+        id_row.pack(fill=tk.X, pady=(2, 12))
+        id_var = tk.StringVar(value=machine_id)
+        ttk.Entry(id_row, textvariable=id_var, width=24, state="readonly",
+                  font=("Consolas", 11)).pack(side=tk.LEFT)
 
-        key_var = tk.StringVar()
-        key_entry = ttk.Entry(dialog, textvariable=key_var, width=35, font=("Consolas", 11))
-        key_entry.pack(pady=5)
+        def copy_id():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(machine_id)
+            copy_btn.config(text="Скопировано")
 
-        ttk.Label(dialog, text="Формат: KEY-XXXXXXXXXXXX-YYYY-MM-DD",
-                  font=("Arial", 8), foreground="gray").pack()
+        copy_btn = ttk.Button(id_row, text="Копировать", command=copy_id)
+        copy_btn.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(body, text="Лицензионный ключ (вставьте целиком):").pack(anchor="w")
+        key_text = tk.Text(body, width=46, height=3, wrap="char", font=("Consolas", 10),
+                           relief="solid", borderwidth=1)
+        key_text.pack(fill=tk.X, pady=(2, 4))
+        key_text.focus_set()
+        ttk.Label(body, text="Ключ начинается с SV- и выдается для ID этого компьютера.",
+                  foreground=COLOR_MUTED).pack(anchor="w")
+
+        def paste():
+            try:
+                key_text.delete("1.0", tk.END)
+                key_text.insert("1.0", self.root.clipboard_get().strip())
+            except tk.TclError:
+                pass
 
         def activate():
-            key = key_var.get()
+            key = key_text.get("1.0", tk.END).strip()
             if self.license.activate(key):
-                messagebox.showinfo("Успех", "Лицензия активирована!")
+                messagebox.showinfo("Лицензия", "Лицензия активирована.", parent=dialog)
                 self._update_status()
                 dialog.destroy()
+            elif self.license.is_old_format(key):
+                messagebox.showerror("Лицензия",
+                    "Это ключ старого формата, с версии 1.9.0 он не действует.\n"
+                    "Отправьте ID компьютера администратору и получите новый ключ.",
+                    parent=dialog)
             else:
-                messagebox.showerror("Ошибка", "Неверный ключ лицензии!")
+                messagebox.showerror("Лицензия",
+                    "Ключ не подходит. Проверьте, что он скопирован целиком\n"
+                    "и выдан для ID этого компьютера.", parent=dialog)
 
-        ttk.Button(dialog, text="Активировать", command=activate).pack(pady=15)
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(buttons, text="Активировать", style="Accent.TButton",
+                   command=activate).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Вставить", command=paste).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(buttons, text="Отмена", command=dialog.destroy).pack(side=tk.LEFT)
 
     def _show_template_dialog(self):
         dialog = tk.Toplevel(self.root)

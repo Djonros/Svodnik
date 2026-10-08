@@ -9,3 +9,6 @@ dist/
 *.egg-info/
 .env
 .venv/
+# Закрытый ключ подписи лицензий хранится только у распространителя
+.svodnik_signing_key
+*signing_key*

@@ -10,20 +10,21 @@ from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from license import LicenseManager
+import signing
+from signing import LicenseManager
 
 
 class KeygenApp:
     """GUI генератор лицензионных ключей."""
 
-    VERSION = "1.0.0"
+    VERSION = "2.0.0"
     APP_NAME = "Сводник — Генератор ключей"
 
     def __init__(self):
         self.license = LicenseManager()
         self.root = tk.Tk()
         self.root.title(f"{self.APP_NAME} v{self.VERSION}")
-        self.root.geometry("520x400")
+        self.root.geometry("680x400")
         self.root.resizable(False, False)
 
         self._setup_ui()
@@ -69,8 +70,8 @@ class KeygenApp:
         result_frame.pack(fill=tk.X, padx=20, pady=5)
 
         self.key_var = tk.StringVar()
-        key_entry = ttk.Entry(result_frame, textvariable=self.key_var, width=40, state="readonly",
-                              font=("Consolas", 12))
+        key_entry = ttk.Entry(result_frame, textvariable=self.key_var, width=70, state="readonly",
+                              font=("Consolas", 9))
         key_entry.pack(side=tk.LEFT, padx=(0, 10))
 
         def copy_key():
@@ -105,8 +106,12 @@ class KeygenApp:
             messagebox.showerror("Ошибка", "Некорректная дата!")
             return
 
-        key_hash = self.license.generate_key(machine_id, expiry)
-        key = f"KEY-{key_hash}-{expiry}"
+        try:
+            secret = signing.load_secret()
+        except (RuntimeError, ValueError) as e:
+            messagebox.showerror("Ключ подписи", str(e))
+            return
+        key = signing.make_key(secret, machine_id, expiry)
 
         self.key_var.set(key)
         self.status_label.config(text=f"Ключ сгенерирован для {machine_id}", foreground="green")

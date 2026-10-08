@@ -1,20 +1,29 @@
 """
-Модуль лицензирования для KOMPAS Export Pro.
+Модуль лицензирования Сводника.
 Поддержка пробного периода и полной лицензии.
+
+Ключ подписан закрытым ключом Ed25519, который хранится только у
+распространителя (генератор ключей в keygen/). В программе лежит лишь
+открытый ключ PUBLIC_KEY: им можно проверить ключ, но нельзя создать новый.
+Формат ключа: SV-ГГГГ-ММ-ДД-<подпись base32>.
 """
 
+import base64
 import hashlib
 import json
 import os
 import platform
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
+
+import ed25519
 
 
 class LicenseManager:
     """Менеджер лицензий с привязкой к оборудованию."""
 
-    SECRET_KEY = "Svodnik2024SecretKey!"
+    PUBLIC_KEY = "4c9aafabd94ce5daf3ea761edeb590a810555e2978a0049b1ec691707e27d1c6"
+    KEY_PREFIX = "SV"
     LICENSE_FILE = os.path.join(os.path.expanduser("~"), ".svodnik_license.dat")
     TRIAL_DAYS = 14
     MAX_EXPORTS_TRIAL = 5  # Максимум экспорта в пробном режиме
@@ -22,6 +31,7 @@ class LicenseManager:
     def __init__(self):
         self.license_data = {}
         self.is_licensed = False
+        self.old_key = False
         self.days_left = 0
         self.exports_count = 0
         self.load_license()
@@ -81,15 +91,39 @@ class LicenseManager:
         """Получение уникального ID компьютера."""
         return self.get_machine_ids()[0]
 
-    def generate_key(self, machine_id: str, expiry_date: str) -> str:
-        """Генерация лицензионного ключа."""
-        raw = f"{machine_id}|{expiry_date}|{self.SECRET_KEY}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:12]
+    @staticmethod
+    def signed_message(machine_id: str, expiry_date: str) -> bytes:
+        """Что подписывается ключом: ID компьютера и дата окончания."""
+        return f"svodnik1|{machine_id}|{expiry_date}".encode()
 
-    def validate_key(self, key: str, machine_id: str, expiry_date: str) -> bool:
-        """Проверка лицензионного ключа."""
-        expected = self.generate_key(machine_id, expiry_date)
-        return key == expected
+    @classmethod
+    def parse_key(cls, key: str):
+        """Разобрать ключ SV-ГГГГ-ММ-ДД-ПОДПИСЬ. Вернуть (дата, подпись) или None."""
+        parts = "".join(key.split()).upper().split("-")
+        if len(parts) != 5 or parts[0] != cls.KEY_PREFIX:
+            return None
+        expiry = f"{parts[1]}-{parts[2]}-{parts[3]}"
+        try:
+            datetime.strptime(expiry, "%Y-%m-%d")
+            sig = parts[4]
+            signature = base64.b32decode(sig + "=" * (-len(sig) % 8))
+        except (ValueError, base64.binascii.Error):
+            return None
+        return expiry, signature
+
+    @staticmethod
+    def is_old_format(key: str) -> bool:
+        """Ключ прежнего формата KEY-XXXXXXXXXXXX-ГГГГ-ММ-ДД (до версии 1.9.0)."""
+        return "".join(key.split()).upper().startswith("KEY-")
+
+    def validate_key(self, key: str, machine_id: str) -> bool:
+        """Проверка подписи ключа для указанного ID компьютера."""
+        parsed = self.parse_key(key)
+        if not parsed:
+            return False
+        expiry, signature = parsed
+        return ed25519.verify(bytes.fromhex(self.PUBLIC_KEY),
+                              self.signed_message(machine_id, expiry), signature)
 
     def save_license(self, key: str, expiry_date: str, machine_id: str):
         """Сохранение лицензии."""
@@ -114,15 +148,17 @@ class LicenseManager:
                 self.license_data = json.load(f)
 
             key = self.license_data.get("key", "")
-            expiry = self.license_data.get("expiry", "")
+            parsed = self.parse_key(key)
 
-            if key and any(self.validate_key(key, mid, expiry)
-                           for mid in self.get_machine_ids()):
+            if parsed and any(self.validate_key(key, mid) for mid in self.get_machine_ids()):
+                expiry = parsed[0]
                 self.is_licensed = True
                 expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
                 self.days_left = (expiry_dt - datetime.now()).days
                 self.exports_count = self.license_data.get("exports", 0)
             else:
+                # Ключ прежнего формата перестал действовать: нужен новый
+                self.old_key = bool(key) and not parsed
                 self._init_trial()
         except Exception:
             self._init_trial()
@@ -151,17 +187,13 @@ class LicenseManager:
 
     def activate(self, key: str) -> bool:
         """Активация лицензии."""
-        # Формат: KEY-XXXXXXXXXXXX-YYYY-MM-DD (5 частей при split)
-        parts = key.split("-")
-        if len(parts) != 5 or parts[0] != "KEY":
+        parsed = self.parse_key(key)
+        if not parsed:
             return False
-
-        key_hash = parts[1]
-        expiry_date = f"{parts[2]}-{parts[3]}-{parts[4]}"
-
+        key = "".join(key.split()).upper()
         for machine_id in self.get_machine_ids():
-            if self.validate_key(key_hash, machine_id, expiry_date):
-                self.save_license(key_hash, expiry_date, machine_id)
+            if self.validate_key(key, machine_id):
+                self.save_license(key, parsed[0], machine_id)
                 self.load_license()
                 return True
         return False
@@ -191,6 +223,8 @@ class LicenseManager:
                 return "Лицензия: истекла"
         else:
             remaining = self.MAX_EXPORTS_TRIAL - self.exports_count
+            if self.old_key:
+                return f"Нужен новый ключ: {remaining}/{self.MAX_EXPORTS_TRIAL} пробных экспортов"
             return f"Пробный режим: {remaining}/{self.MAX_EXPORTS_TRIAL} экспортов (осталось {self.days_left} дн.)"
 
     def is_valid(self) -> bool:
@@ -200,10 +234,3 @@ class LicenseManager:
         if not self.is_licensed and self.exports_count < self.MAX_EXPORTS_TRIAL and self.days_left > 0:
             return True
         return False
-
-    def get_key_template(self) -> str:
-        """Получение шаблона ключа для текущего компьютера."""
-        machine_id = self.get_machine_id()
-        expiry = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
-        key_hash = self.generate_key(machine_id, expiry)
-        return f"KEY-{key_hash[:12]}-{expiry}"
