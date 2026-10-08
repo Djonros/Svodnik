@@ -61,6 +61,10 @@ class KompasExportFinal:
         self.specs_dir = ""
         self.all_data = []
         self.all_positions = {}
+        self.spec_quantities = {}
+        self.model_counts = {}
+        self.quantity_warnings = []
+        self.problems = []
         self.opened_docs = []
         self.template = template or self._default_template()
         if template:
@@ -139,7 +143,8 @@ class KompasExportFinal:
         print(f"[OK] Корень: {self.top_part.Name} ({self.top_part.Marking})")
 
         self.all_data = []
-        seen = set()
+        self.model_counts = {}
+        self.problems = []
 
         # Добавляем корень (главную сборку)
         root_info = {
@@ -163,21 +168,46 @@ class KompasExportFinal:
             pass
 
         self.all_data.append(root_info)
-        seen.add(f"{root_info['marking']}|{root_info['name']}")
 
         # Обходим дочерние элементы
-        self._walk_parts(self.top_part, level=1, parent_name=self.top_part.Name, seen=seen)
+        self._walk_parts(self.top_part, level=1, parent_name=self.top_part.Name,
+                         parent_marking=root_info["marking"], ancestors=set())
 
         print(f"[OK] Найдено элементов: {len(self.all_data)}")
         return True
 
-    def _walk_parts(self, part, level, parent_name, seen):
+    def _problem(self, message):
+        """Проблема, из-за которой ведомость может быть неполной или неточной:
+        пишется в лог и показывается пользователю в конце экспорта."""
+        self.problems.append(message)
+        print(f"[!!] {message}")
+
+    MAX_DEPTH = 30
+
+    def _walk_parts(self, part, level, parent_name, parent_marking="", ancestors=None):
+        """Обход вставок сборки. Каждая вставка компонента дает отдельную
+        запись с количеством 1; одинаковые позиции суммируются при группировке.
+        Повторы НЕ отсекаются: две одинаковые детали в сборке = количество 2."""
+        if ancestors is None:
+            ancestors = set()
+        if level > self.MAX_DEPTH:
+            self._problem(f"Слишком глубокая вложенность в '{parent_name}', "
+                          f"дальше состав не читался")
+            return
+
         try:
             parts = part.Parts
-            if not parts:
-                return
+            count = parts.Count if parts else 0
+        except Exception as e:
+            self._problem(f"Не прочитан состав '{parent_name}', его детали не попали "
+                          f"в ведомость: {e}")
+            return
 
-            for i in range(parts.Count):
+        # Количество вставок по обозначению на один экземпляр родителя (для сверки со .spw)
+        counts = {}
+
+        for i in range(count):
+            try:
                 model_obj = parts.Item(i)
                 if not model_obj:
                     continue
@@ -186,57 +216,71 @@ class KompasExportFinal:
                 except Exception:
                     p7 = model_obj
 
+                # Компоновочная геометрия в состав изделия не входит
+                try:
+                    if p7.IsLayoutGeometry:
+                        continue
+                except Exception:
+                    pass
+
                 name = p7.Name or "Без имени"
                 marking = p7.Marking or ""
+            except Exception as e:
+                self._problem(f"Пропущен компонент №{i + 1} в '{parent_name}': {e}")
+                continue
 
-                # Используем уникальную ссылку для предотвращения зацикливания
-                try:
-                    p7_ref = p7.Reference
-                except:
-                    p7_ref = f"{marking}|{name}|{level}"
+            # Защита от зацикливания: компонент не может входить сам в себя
+            try:
+                file_key = (p7.FileName or "").lower()
+            except Exception:
+                file_key = ""
+            if file_key and file_key in ancestors:
+                continue
 
-                if p7_ref in seen:
-                    continue
-                seen.add(p7_ref)
+            info = {
+                "level": level,
+                "parent": parent_name,
+                "name": name,
+                "marking": marking,
+                "quantity": 1,
+                "is_assembly": False,
+                "mass": None,
+                "material": "",
+                "is_bending": False,
+            }
 
-                info = {
-                    "level": level,
-                    "parent": parent_name,
-                    "name": name,
-                    "marking": marking,
-                    "quantity": 1,
-                    "is_assembly": False,
-                    "mass": None,
-                    "material": "",
-                    "is_bending": False,
-                }
+            label = f"'{name}' ({marking})" if marking else f"'{name}'"
+            try:
+                info["mass"] = p7.Mass
+            except Exception as e:
+                self._problem(f"Не прочитана масса {label} в '{parent_name}': {e}")
+            try:
+                info["material"] = p7.Material or ""
+            except Exception as e:
+                self._problem(f"Не прочитан материал {label} в '{parent_name}': {e}")
 
-                try:
-                    info["mass"] = p7.Mass
-                except:
-                    pass
-                try:
-                    info["material"] = p7.Material or ""
-                except:
-                    pass
+            try:
+                child_parts = p7.Parts
+                if child_parts and child_parts.Count > 0:
+                    info["is_assembly"] = True
+            except Exception as e:
+                self._problem(f"Не прочитан состав {label} в '{parent_name}', "
+                              f"компонент учтен как деталь: {e}")
 
-                try:
-                    child_parts = p7.Parts
-                    if child_parts and child_parts.Count > 0:
-                        info["is_assembly"] = True
-                except:
-                    pass
+            info["is_bending"] = (
+                self._check_unfold(p7) if not info["is_assembly"] else False
+            )
 
-                info["is_bending"] = (
-                    self._check_unfold(p7) if not info["is_assembly"] else False
-                )
+            self.all_data.append(info)
+            if marking:
+                counts[marking] = counts.get(marking, 0) + 1
 
-                self.all_data.append(info)
+            if info["is_assembly"]:
+                child_ancestors = ancestors | {file_key} if file_key else ancestors
+                self._walk_parts(p7, level + 1, name, marking, child_ancestors)
 
-                if info["is_assembly"]:
-                    self._walk_parts(p7, level + 1, name, seen)
-        except Exception as e:
-            pass
+        if parent_marking:
+            self.model_counts[parent_marking] = counts
 
     def _check_unfold(self, p7):
         """Статус развертки: True, только если у детали есть листовое тело
@@ -278,6 +322,7 @@ class KompasExportFinal:
         print("\nЧтение позиций из спецификаций...")
 
         self.all_positions = {}
+        self.spec_quantities = {}
 
         # Ищем .spw файлы (все спецификации в папке Рабочка)
         parent_dir = os.path.dirname(self.assembly_dir)
@@ -290,15 +335,70 @@ class KompasExportFinal:
                     all_spw.append(os.path.join(search_dir, f))
 
         print(f"  Найдено .spw файлов: {len(all_spw)}")
+        if not all_spw:
+            self._problem("Не найдены спецификации (*СП*.spw) рядом со сборкой и на "
+                          "уровень выше: позиции не заполнены, сверка количества не сделана")
         for spw in all_spw:
             try:
                 positions = self._read_spw(spw)
                 self.all_positions.update(positions)
-            except:
-                pass
+                self.spec_quantities[os.path.basename(spw)] = {
+                    d: p["quantity"] for d, p in positions.items()
+                }
+            except Exception as e:
+                self._problem(f"Не прочитана спецификация {os.path.basename(spw)}: {e}")
 
         print(f"[OK] Найдено позиций: {len(self.all_positions)}")
+        self.check_quantities()
         return True
+
+    @staticmethod
+    def _parse_qty(text):
+        m = re.match(r"\s*(\d+)", str(text or ""))
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _norm(text):
+        return re.sub(r"\s+", "", str(text or "")).lower()
+
+    def check_quantities(self):
+        """Сверка количества вставок в модели с колонкой "Кол." спецификации.
+        Спецификация сопоставляется со сборкой по обозначению в начале имени .spw."""
+        self.quantity_warnings = []
+        checked = 0
+        for parent_marking, counts in self.model_counts.items():
+            key = self._norm(parent_marking)
+            spec_name = None
+            for fname in self.spec_quantities:
+                if self._norm(fname).startswith(key):
+                    spec_name = fname
+                    break
+            if not spec_name:
+                continue
+            checked += 1
+            spec = self.spec_quantities[spec_name]
+            for designation, qty_text in spec.items():
+                spec_qty = self._parse_qty(qty_text)
+                if spec_qty is None:
+                    continue
+                model_qty = counts.get(designation)
+                if model_qty is None:
+                    for m, c in counts.items():
+                        if self._norm(m) == self._norm(designation):
+                            model_qty = c
+                            break
+                if model_qty is None:
+                    model_qty = 0
+                if model_qty != spec_qty:
+                    self.quantity_warnings.append(
+                        f"{parent_marking}: {designation} — в модели {model_qty}, "
+                        f"в спецификации {spec_qty}"
+                    )
+
+        print(f"Сверка количества со спецификациями: проверено сборок {checked}, "
+              f"расхождений {len(self.quantity_warnings)}")
+        for w in self.quantity_warnings:
+            print(f"  [??] {w}")
 
     def _read_spw(self, spw_path):
         """Чтение позиций из .spw файла."""
@@ -310,6 +410,8 @@ class KompasExportFinal:
 
             sd = doc.SpecificationDescriptions
             if not sd or sd.Count == 0:
+                self._problem(f"В спецификации {os.path.basename(spw_path)} нет описания, "
+                              f"позиции из нее не прочитаны")
                 return positions
 
             spec_desc = sd.Item(0)
@@ -321,6 +423,7 @@ class KompasExportFinal:
                 time.sleep(1)
 
             objects = spec_desc.Objects
+            bad_rows = 0
 
             for obj in objects:
                 try:
@@ -346,10 +449,14 @@ class KompasExportFinal:
                             "name": name_text,
                             "quantity": qty_text,
                         }
-                except:
+                except Exception:
+                    bad_rows += 1
                     continue
-        except:
-            pass
+            if bad_rows:
+                self._problem(f"В спецификации {os.path.basename(spw_path)} не прочитано "
+                              f"строк: {bad_rows}")
+        except Exception as e:
+            self._problem(f"Не открыта спецификация {os.path.basename(spw_path)}: {e}")
 
         return positions
 

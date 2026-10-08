@@ -7,6 +7,8 @@ import sys
 import os
 import json
 import itertools
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -18,6 +20,27 @@ from kompas_export_final import KompasExportFinal
 RECENT_FILE = os.path.join(os.path.expanduser("~"), ".svodnik_recent.json")
 MAX_RECENT = 10
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+class _QueueWriter:
+    """Подмена stdout на время экспорта: печать из фонового потока
+    построчно передается в очередь, окно выводит ее в лог по ходу работы."""
+
+    def __init__(self, q):
+        self._queue = q
+        self._buffer = ""
+
+    def write(self, text):
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._queue.put(("out", line))
+        return len(text)
+
+    def flush(self):
+        if self._buffer:
+            self._queue.put(("out", self._buffer))
+            self._buffer = ""
 
 
 def load_recent():
@@ -48,7 +71,7 @@ def add_to_recent(filepath):
 
 class KompasExportApp:
 
-    VERSION = "1.6.2"
+    VERSION = "1.6.3"
     APP_NAME = "Сводник"
 
     def __init__(self):
@@ -74,12 +97,22 @@ class KompasExportApp:
         self._spinner_running = False
         self._spinner_cycle = itertools.cycle(SPINNER_FRAMES)
         self._current_template = None
+        self._busy = False
+        self._export_ctx = None
 
         self._setup_menu()
         self._setup_ui()
         self._update_status()
         self._load_recent_list()
         self._setup_dragdrop()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        if self._busy and not messagebox.askyesno(
+                "Экспорт не завершен",
+                "Экспорт еще выполняется. Закрыть программу?"):
+            return
+        self.root.destroy()
 
     def _setup_menu(self):
         menubar = tk.Menu(self.root)
@@ -328,17 +361,41 @@ class KompasExportApp:
             if line.strip():
                 self._log(line)
 
-    @staticmethod
-    def _run_captured(func, *args, **kwargs):
-        """Запуск функции с перехватом stdout (печать экспорта попадает в лог)."""
-        import io
+    def _run_in_background(self, job, on_done):
+        """Выполнение job в фоновом потоке, чтобы окно не зависало.
+        Печать job построчно попадает в лог по ходу работы;
+        on_done(result, error) вызывается в главном потоке."""
+        q = queue.Queue()
+        writer = _QueueWriter(q)
         old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        try:
-            result = func(*args, **kwargs)
-            return result, sys.stdout.getvalue()
-        finally:
-            sys.stdout = old_stdout
+        sys.stdout = writer
+
+        def worker():
+            try:
+                result, error = job(), None
+            except Exception as e:
+                result, error = None, e
+            writer.flush()
+            q.put(("done", result, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                while True:
+                    kind, *payload = q.get_nowait()
+                    if kind == "out":
+                        if payload[0].strip():
+                            self._log(payload[0])
+                    else:
+                        sys.stdout = old_stdout
+                        on_done(*payload)
+                        return
+            except queue.Empty:
+                pass
+            self.root.after(100, poll)
+
+        poll()
 
     def _export(self):
         if not self.license.is_valid():
@@ -372,52 +429,98 @@ class KompasExportApp:
             return
 
         self.export_btn.config(state="disabled")
+        self._busy = True
         self._start_spinner()
         fmt_list = ", ".join(sorted(formats)).upper()
         self._log(f"Начало экспорта ({fmt_list})...")
 
-        exporter = KompasExportFinal(template=self._current_template)
+        self._export_ctx = {
+            "exporter": KompasExportFinal(template=self._current_template),
+            "filepath": filepath,
+            "formats": formats,
+            "costs": self.export_costs.get() and "excel" in formats,
+        }
+        self._run_in_background(self._analyze_job, self._after_analyze)
+
+    def _analyze_job(self):
+        """Фоновый поток: чтение сборки и спецификаций из КОМПАС.
+        Вся работа с COM (включая закрытие документов) идет в этом потоке."""
+        import pythoncom
+        exporter = self._export_ctx["exporter"]
+        pythoncom.CoInitialize()
         try:
-            ok, output = self._run_captured(exporter.analyze, filepath)
-            self._log_output(output)
-            if not ok:
-                raise RuntimeError("Не удалось подключиться к КОМПАС "
-                                   "или открыть сборку (см. лог выше)")
-
-            if self.edit_before_export.get():
-                from row_editor import RowEditorDialog
-                editor = RowEditorDialog(self.root, exporter.all_data)
-                self.root.wait_window(editor)
-                if not editor.applied:
-                    self._log("Экспорт отменен в редакторе строк")
-                    return
-
-            _, output = self._run_captured(exporter.generate, formats)
-            self._log_output(output)
-
-            if self.export_costs.get():
-                _, output = self._run_captured(exporter.calculate_costs)
-                self._log_output(output)
-                if "excel" in formats:
-                    _, output = self._run_captured(exporter.generate_excel)
-                    self._log_output(output)
-
-            add_to_recent(filepath)
-            self._load_recent_list()
-
-            self.license.record_export()
-            self._update_status()
-
-            self._log("Экспорт завершен успешно!")
-            messagebox.showinfo("Готово", "Экспорт завершен!\nФайлы сохранены в папке сборки.")
-
-        except Exception as e:
-            self._log(f"Ошибка: {str(e)}")
-            messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{str(e)}")
+            return exporter.analyze(self._export_ctx["filepath"])
         finally:
-            self._run_captured(exporter.close_all_docs)
-            self._stop_spinner()
-            self.export_btn.config(state="normal")
+            exporter.close_all_docs()
+            exporter.app = exporter.doc = exporter.doc3d = exporter.top_part = None
+            pythoncom.CoUninitialize()
+
+    def _after_analyze(self, ok, error):
+        if error is None and not ok:
+            error = RuntimeError("Не удалось подключиться к КОМПАС "
+                                 "или открыть сборку (см. лог выше)")
+        if error is not None:
+            self._finish_export(error)
+            return
+
+        if self.edit_before_export.get():
+            from row_editor import RowEditorDialog
+            editor = RowEditorDialog(self.root, self._export_ctx["exporter"].all_data)
+            self.root.wait_window(editor)
+            if not editor.applied:
+                self._log("Экспорт отменен в редакторе строк")
+                self._finish_export()
+                return
+
+        self._run_in_background(self._generate_job, self._after_generate)
+
+    def _generate_job(self):
+        """Фоновый поток: формирование документов (КОМПАС уже не нужен)."""
+        exporter = self._export_ctx["exporter"]
+        if self._export_ctx["costs"]:
+            exporter.calculate_costs()
+        return exporter.generate(self._export_ctx["formats"])
+
+    def _after_generate(self, result, error):
+        if error is not None:
+            self._finish_export(error)
+            return
+
+        exporter = self._export_ctx["exporter"]
+        add_to_recent(self._export_ctx["filepath"])
+        self._load_recent_list()
+
+        self.license.record_export()
+        self._update_status()
+
+        self._log("Экспорт завершен успешно!")
+        self._finish_export()
+
+        message = "Экспорт завершен!\nФайлы сохранены в папке сборки."
+        sections = []
+        for title, items in (
+            ("Ошибки чтения из КОМПАС, ведомость может быть неполной", exporter.problems),
+            ("Количество в модели не совпадает со спецификацией", exporter.quantity_warnings),
+        ):
+            if items:
+                shown = "\n".join(items[:8])
+                more = f"\n... и еще {len(items) - 8} (см. лог)" if len(items) > 8 else ""
+                sections.append(f"{title} ({len(items)}):\n{shown}{more}")
+        if sections:
+            self._log(f"Внимание: проблем {len(exporter.problems)}, "
+                      f"расхождений количества {len(exporter.quantity_warnings)}")
+            messagebox.showwarning("Готово, проверьте ведомость",
+                                   message + "\n\n" + "\n\n".join(sections))
+        else:
+            messagebox.showinfo("Готово", message)
+
+    def _finish_export(self, error=None):
+        self._stop_spinner()
+        self.export_btn.config(state="normal")
+        self._busy = False
+        if error is not None:
+            self._log(f"Ошибка: {error}")
+            messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{error}")
 
     def _show_machine_id(self):
         machine_id = self.license.get_machine_id()
