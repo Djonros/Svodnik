@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
 
 a = Analysis(
-    ['C:\\Users\\djonr\\Svodnik Distribution\\app\\gui_app.py'],
+    [os.path.join(SPECPATH, 'app', 'gui_app.py')],
     pathex=[],
     binaries=[],
     datas=[],
