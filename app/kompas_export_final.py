@@ -66,6 +66,7 @@ class KompasExportFinal:
         self.quantity_warnings = []
         self.problems = []
         self.bend_cache = {}
+        self.length_cache = {}
         self.opened_docs = []
         self.template = template or self._default_template()
         if template:
@@ -271,6 +272,8 @@ class KompasExportFinal:
             info["is_bending"] = (
                 self._is_bent(p7, info["material"]) if not info["is_assembly"] else False
             )
+            if not info["is_assembly"]:
+                info["stock_length"] = self._stock_length(p7, name, info["material"])
 
             self.all_data.append(info)
             if marking:
@@ -318,6 +321,95 @@ class KompasExportFinal:
         if key:
             self.bend_cache[key] = bent
         return bent
+
+    # Сортовой прокат, для которого заполняется "Длина сортамента"
+    STOCK_RE = re.compile(r"профил|труб|уголок|уголк|швеллер|двутавр|балк|круг|квадрат|"
+                          r"шестигран|арматур|пруток|полос", re.IGNORECASE)
+    LENGTH_IN_NAME_RE = re.compile(r"\bL\s*=\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+    def _stock_length(self, p7, name, material):
+        """Длина детали из сортового проката, мм (строкой), или "" для остальных.
+        Прокат определяется по материалу, а если материал не задан
+        (или задан по умолчанию) - по наименованию; детали из листа не считаются.
+        Длина берется из "L = ... мм" в наименовании/файле (так ее пишет библиотека
+        металлоконструкций), иначе - наибольший габарит детали в ее собственной
+        системе координат."""
+        material = material or ""
+        if self.SHEET_MATERIAL_RE.search(material) and not re.search(r"полос", material, re.IGNORECASE):
+            return ""
+        if not (self.STOCK_RE.search(material) or
+                ((not material or is_default_material(material)) and self.STOCK_RE.search(name or ""))):
+            return ""
+        try:
+            path = p7.FileName or ""
+        except Exception:
+            path = ""
+        key = path.lower()
+        if key and key in self.length_cache:
+            return self.length_cache[key]
+
+        length = ""
+        for text in (name, os.path.basename(path)):
+            m = self.LENGTH_IN_NAME_RE.search(text or "")
+            if m:
+                length = m.group(1).replace(",", ".")
+                break
+        if not length and path:
+            dims = self._part_own_size(path)
+            if dims:
+                size = max(dims)
+                # Деталь может лежать в своей системе координат наискосок: тогда
+                # ее длину дает самое длинное прямое ребро (если оно помещается в габарит)
+                diagonal = sum(d * d for d in dims) ** 0.5
+                edge = self._longest_straight_edge(p7)
+                if size < edge <= diagonal + 0.5:
+                    size = edge
+                length = str(int(round(size)))
+        if not length:
+            self._problem(f"Не определена длина сортамента у '{name}'")
+        if key:
+            self.length_cache[key] = length
+        return length
+
+    def _part_own_size(self, path):
+        """Габариты детали (x, y, z) в ее собственной системе координат
+        (в сборке деталь может быть повернута, и габарит в сборке неверен)."""
+        doc = None
+        already_open = False
+        try:
+            for i in range(self.app.Documents.Count):
+                d = self.app.Documents.Item(i)
+                if (d.PathName or "").lower() == path.lower():
+                    doc, already_open = d, True
+                    break
+            if doc is None:
+                doc = self.app.Documents.Open(path, False, True)
+            top = win32com.client.CastTo(
+                win32com.client.CastTo(doc, "IKompasDocument3D").TopPart, "IPart7")
+            g = top.GetGabarit(True, True)
+            return [abs(g[i + 4] - g[i + 1]) for i in range(3)]
+        except Exception as e:
+            print(f"[--] Габарит {os.path.basename(path)} не прочитан: {e}")
+            return None
+        finally:
+            if doc is not None and not already_open:
+                try:
+                    doc.Close(0)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _longest_straight_edge(p7):
+        """Длина самого длинного прямого ребра детали, мм."""
+        best = 0.0
+        try:
+            for e in (win32com.client.CastTo(p7, "IFeature7").ModelObjects(7) or ()):  # o3d_edge
+                e = win32com.client.CastTo(e, "IEdge")
+                if e.IsStraight:
+                    best = max(best, e.GetLength(0) * 10.0)  # GetLength в см
+        except Exception:
+            pass
+        return best
 
     def _sheet_metal_bent(self, p7):
         try:

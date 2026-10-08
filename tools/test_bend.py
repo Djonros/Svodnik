@@ -32,7 +32,7 @@ for it in exp.all_data:
     if k in seen:
         continue
     seen.add(k)
-    print(("ГИБ " if it["is_bending"] else "    ") + f"{it['marking']} {it['name']} | {it['material'][:40]} | t={exp._sheet_thickness(None, it['material'])}")
+    print(("ГИБ " if it["is_bending"] else "    ") + f"{it['marking']} {it['name']} | {it['material'][:40]} | L={it.get('stock_length', '')}")
 print(f"Деталей: {len(seen)}, гнутых: {sum(1 for it in exp.all_data if it['is_bending'] and not it['is_assembly'])} вхождений, время обхода {dt:.1f} c")
 print("Проблемы:", exp.problems[:5])
 doc.Close(0)

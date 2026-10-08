@@ -71,7 +71,7 @@ def add_to_recent(filepath):
 
 class KompasExportApp:
 
-    VERSION = "1.6.4"
+    VERSION = "1.6.5"
     APP_NAME = "Сводник"
 
     def __init__(self):
