@@ -62,6 +62,8 @@ class KompasExportFinal:
         self.all_data = []
         self.all_positions = {}
         self.spec_quantities = {}
+        self.spec_positions = {}
+        self.spec_names = {}
         self.model_counts = {}
         self.quantity_warnings = []
         self.problems = []
@@ -154,7 +156,10 @@ class KompasExportFinal:
             self.assembly_files[self.top_part.Marking] = self.doc.PathName
 
         # Добавляем корень (главную сборку)
+        self._node_seq = 0
         root_info = {
+            "node": 0,
+            "path": (),
             "level": 0,
             "parent": "",
             "name": self.top_part.Name or "Без имени",
@@ -178,7 +183,7 @@ class KompasExportFinal:
 
         # Обходим дочерние элементы
         self._walk_parts(self.top_part, level=1, parent_name=self.top_part.Name,
-                         parent_marking=root_info["marking"], ancestors=set())
+                         parent_marking=root_info["marking"], ancestors=set(), path=(0,))
 
         print(f"[OK] Найдено элементов: {len(self.all_data)}")
         return True
@@ -191,7 +196,7 @@ class KompasExportFinal:
 
     MAX_DEPTH = 30
 
-    def _walk_parts(self, part, level, parent_name, parent_marking="", ancestors=None):
+    def _walk_parts(self, part, level, parent_name, parent_marking="", ancestors=None, path=(0,)):
         """Обход вставок сборки. Каждая вставка компонента дает отдельную
         запись с количеством 1; одинаковые позиции суммируются при группировке.
         Повторы НЕ отсекаются: две одинаковые детали в сборке = количество 2."""
@@ -244,7 +249,10 @@ class KompasExportFinal:
             if file_key and file_key in ancestors:
                 continue
 
+            self._node_seq += 1
             info = {
+                "node": self._node_seq,
+                "path": path,
                 "level": level,
                 "parent": parent_name,
                 "name": name,
@@ -288,7 +296,8 @@ class KompasExportFinal:
 
             if info["is_assembly"]:
                 child_ancestors = ancestors | {file_key} if file_key else ancestors
-                self._walk_parts(p7, level + 1, name, marking, child_ancestors)
+                self._walk_parts(p7, level + 1, name, marking, child_ancestors,
+                                 path + (info["node"],))
 
         if parent_marking:
             self.model_counts[parent_marking] = counts
@@ -512,6 +521,8 @@ class KompasExportFinal:
 
         self.all_positions = {}
         self.spec_quantities = {}
+        self.spec_positions = {}
+        self.spec_names = {}
 
         # Ищем .spw файлы (все спецификации в папке Рабочка)
         parent_dir = os.path.dirname(self.assembly_dir)
@@ -528,6 +539,7 @@ class KompasExportFinal:
             try:
                 positions = self._read_spw(spw)
                 self.all_positions.update(positions)
+                self.spec_positions[os.path.basename(spw)] = positions
                 self.spec_quantities[os.path.basename(spw)] = {
                     d: p["quantity"] for d, p in positions.items()
                 }
@@ -574,6 +586,7 @@ class KompasExportFinal:
                 doc.SaveAs(spw_path)
                 self.all_positions.update(
                     {d: p for d, p in positions.items() if d not in self.all_positions})
+                self.spec_positions[os.path.basename(spw_path)] = positions
                 self.spec_quantities[os.path.basename(spw_path)] = {
                     d: p["quantity"] for d, p in positions.items()
                 }
@@ -652,6 +665,10 @@ class KompasExportFinal:
     def _read_spec_doc(self, doc, label):
         """Позиции из открытого документа спецификации: {обозначение: {...}}."""
         positions = {}
+        names = {}
+        if not hasattr(self, "spec_names"):
+            self.spec_names = {}
+        self.spec_names[label] = names
         try:
             sd = doc.SpecificationDescriptions
             if not sd or sd.Count == 0:
@@ -688,12 +705,20 @@ class KompasExportFinal:
                     qty_col = cols.Item(5)
                     qty_text = qty_col.Text.Str if qty_col.Text else "1"
 
+                    try:
+                        section = int(obj.Section)
+                    except Exception:
+                        section = None
                     if desig_text and pos_text:
                         positions[desig_text] = {
                             "position": pos_text,
                             "name": name_text,
                             "quantity": qty_text,
+                            "section": section,
                         }
+                    elif name_text and not desig_text:
+                        # Стандартные и прочие изделия: без обозначения, ищутся по наименованию
+                        names.setdefault(name_text, {"position": pos_text, "section": section})
                 except Exception:
                     bad_rows += 1
                     continue
@@ -714,16 +739,39 @@ class KompasExportFinal:
                 pass
         self.opened_docs.clear()
 
-    def generate_excel(self):
-        """Генерация Excel по шаблону."""
-        print("\nСоздание Excel файла...")
+    # Разделы спецификации (номера как в КОМПАС) и их заголовки в листе по сборкам
+    SECTION_TITLES = {
+        15: "2. Сборочные единицы",
+        20: "4. Детали",
+        25: "5. Стандартные изделия",
+        30: "6. Прочие изделия",
+        35: "7. Материалы",
+    }
+    STANDARD_RE = re.compile(
+        r"\b(болт|винт|гайк|шайб|шплинт|штифт|шпильк|заклепк|подшипник|манжет|"
+        r"кольцо|пружин\w* шайб|масленк|гост|ост\s|din|iso)", re.IGNORECASE)
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = os.path.splitext(self.assembly_name)[0][:31]
+    @staticmethod
+    def _col_letter(col_idx):
+        return (chr(64 + col_idx) if col_idx <= 26
+                else chr(64 + (col_idx - 1) // 26) + chr(65 + (col_idx - 1) % 26))
 
+    def _excel_styles(self):
         tmpl = self.template.get("excel", {})
-        columns = tmpl.get("columns", [])
+        header_color = tmpl.get("header_color", "2F5496")
+        assembly_color = tmpl.get("assembly_color", "D6E4F0")
+        side = Side(style="thin")
+        return {
+            "header_font": Font(bold=True, size=10, color="FFFFFF"),
+            "header_fill": PatternFill(start_color=header_color, end_color=header_color, fill_type="solid"),
+            "assembly_fill": PatternFill(start_color=assembly_color, end_color=assembly_color, fill_type="solid"),
+            "border": Border(left=side, right=side, top=side, bottom=side),
+            "center": Alignment(horizontal="center", vertical="center", wrap_text=True),
+            "left": Alignment(horizontal="left", vertical="center", wrap_text=True),
+        }
+
+    def _excel_columns(self):
+        columns = self.template.get("excel", {}).get("columns", [])
         if not columns:
             columns = [
                 {"key": "position", "header": "Позиция", "width": 8},
@@ -735,103 +783,214 @@ class KompasExportFinal:
                 {"key": "stock_length", "header": "Длина сортамента", "width": 12},
                 {"key": "bending", "header": "Гибка", "width": 8},
             ]
+        return list(columns)
 
-        header_color = tmpl.get("header_color", "2F5496")
-        assembly_color = tmpl.get("assembly_color", "D6E4F0")
-
-        header_font = Font(bold=True, size=10, color="FFFFFF")
-        header_fill = PatternFill(start_color=header_color, end_color=header_color, fill_type="solid")
-        assembly_fill = PatternFill(start_color=assembly_color, end_color=assembly_color, fill_type="solid")
-        border = Border(
-            left=Side(style="thin"), right=Side(style="thin"),
-            top=Side(style="thin"), bottom=Side(style="thin"),
-        )
-        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
+    def _write_header(self, ws, columns, st, fills=None):
         for col_idx, col_def in enumerate(columns, 1):
             cell = ws.cell(row=1, column=col_idx)
             cell.value = col_def.get("header", "")
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = center
-            cell.border = border
-            col_letter = chr(64 + col_idx) if col_idx <= 26 else chr(64 + (col_idx - 1) // 26) + chr(65 + (col_idx - 1) % 26)
-            ws.column_dimensions[col_letter].width = col_def.get("width", 15)
+            cell.font = st["header_font"]
+            cell.fill = (fills or {}).get(col_def.get("key"), st["header_fill"])
+            cell.alignment = st["center"]
+            cell.border = st["border"]
+            ws.column_dimensions[self._col_letter(col_idx)].width = col_def.get("width", 15)
+        ws.row_dimensions[1].height = 35
+        ws.freeze_panes = "A2"
 
-        if hasattr(self, 'cost_data') and self.cost_data:
+    def _row_data(self, item, quantity, position):
+        mass_kg = (item.get("mass", 0) or 0) / 1000
+        is_asm = item.get("is_assembly", False)
+        material = item.get("material", "")
+        if is_asm and is_default_material(material):
+            material = ""
+        return {
+            "position": position,
+            "marking": item.get("marking", ""),
+            "name": item.get("name", ""),
+            "quantity": quantity,
+            "mass_kg": round(mass_kg, 6) if mass_kg > 0 else "",
+            "total_mass": round(mass_kg * quantity, 6) if mass_kg > 0 and isinstance(quantity, (int, float)) else "",
+            "material": material,
+            "stock_length": item.get("stock_length", ""),
+            "bending": "X" if item.get("is_bending") else "",
+            "level": item.get("level", 0) + 1 if item.get("level", 0) > 0 else "",
+            "is_assembly": is_asm,
+        }
+
+    def _write_row(self, ws, row, columns, row_data, st, fill=None, font=None):
+        for col_idx, col_def in enumerate(columns, 1):
+            cell = ws.cell(row=row, column=col_idx)
+            cell.value = row_data.get(col_def.get("key", ""), "")
+            cell.border = st["border"]
+            cell.alignment = st["left"] if col_def.get("key") in ("name", "material") else st["center"]
+            if fill:
+                cell.fill = fill
+            if font:
+                cell.font = font
+
+    # ---------------------------------------------------------------- дерево сборок
+
+    def _spec_for(self, marking):
+        """Позиции из спецификации сборки marking: ({обозначение: ...}, {наименование: ...})."""
+        key = self._norm(marking)
+        if key:
+            for label, positions in getattr(self, "spec_positions", {}).items():
+                if self._norm(label).startswith(key):
+                    return positions, self.spec_names.get(label, {})
+        return {}, {}
+
+    def _build_tree(self):
+        """Дети каждого узла: элементы, у которых он ближайший сохранившийся предок
+        (строки, удаленные в редакторе, просто выпадают, их состав поднимается выше)."""
+        items = self.all_data
+        root = items[0]
+        by_node = {it["node"]: it for it in items if it.get("node") is not None}
+        children = {}
+        for it in items[1:]:
+            parent = root
+            for nid in reversed(it.get("path") or ()):
+                if nid in by_node and by_node[nid] is not it:
+                    parent = by_node[nid]
+                    break
+            children.setdefault(id(parent), []).append(it)
+        return root, children
+
+    def _section_of(self, item, spec_pos, spec_names):
+        info = spec_pos.get(item.get("marking", "")) if item.get("marking") else None
+        if not info and not item.get("marking"):
+            info = spec_names.get(item.get("name", ""))
+        section = (info or {}).get("section")
+        if section in self.SECTION_TITLES:
+            return section
+        if item.get("is_assembly"):
+            return 15
+        if not item.get("marking") and self.STANDARD_RE.search(item.get("name", "")):
+            return 25
+        return 20
+
+    def _tree_rows(self):
+        """Строки листа по сборкам: (вид, элемент/заголовок, глубина, кол-во на сборку,
+        всего в изделии, позиция). Одинаковые элементы одной сборки объединяются,
+        повторяющиеся подсборки показываются со своим составом под каждым родителем."""
+        root, children = self._build_tree()
+        rows = [("item", root, 0, 1, 1, "")]
+
+        def walk(node, depth, multiplier, seen):
+            merged = {}
+            order = []
+            for it in children.get(id(node), []):
+                key = (it.get("marking", ""), it.get("name", ""), bool(it.get("is_assembly")))
+                if key not in merged:
+                    merged[key] = [it, 0]
+                    order.append(key)
+                try:
+                    merged[key][1] += float(it.get("quantity", 1) or 1)
+                except (TypeError, ValueError):
+                    merged[key][1] += 1
+            spec_pos, spec_names = self._spec_for(node.get("marking", ""))
+            sections = {}
+            for idx, key in enumerate(order):
+                it, qty = merged[key]
+                qty = int(qty) if float(qty).is_integer() else qty
+                info = spec_pos.get(it.get("marking")) if it.get("marking") else spec_names.get(it.get("name", ""))
+                position = (info or {}).get("position", "")
+                sections.setdefault(self._section_of(it, spec_pos, spec_names), []).append(
+                    (it, qty, position, idx))
+            for section in sorted(sections):
+                rows.append(("section", self.SECTION_TITLES[section], depth, "", "", ""))
+                entries = sorted(sections[section], key=lambda e: (
+                    0 if str(e[2]).strip().isdigit() else 1,
+                    int(e[2]) if str(e[2]).strip().isdigit() else 0, e[3]))
+                for it, qty, position, _ in entries:
+                    total = qty * multiplier
+                    rows.append(("item", it, depth, qty, total, position))
+                    if it.get("is_assembly") and id(it) not in seen:
+                        walk(it, depth + 1, total, seen | {id(it)})
+
+        walk(root, 1, 1, {id(root)})
+        return rows
+
+    def _write_tree_sheet(self, ws, columns, st):
+        """Лист по сборкам: состав каждой подсборки сгруппирован под ее строкой
+        и свернут; +/- стоит на строке подсборки, кнопки 1..N сверху сворачивают по уровням."""
+        from openpyxl.worksheet.properties import Outline
+        q_idx = next((i for i, c in enumerate(columns) if c.get("key") == "quantity"), None)
+        if q_idx is not None and not any(c.get("key") == "total_qty" for c in columns):
+            columns = (columns[:q_idx + 1]
+                       + [{"key": "total_qty", "header": "Всего в изделии", "width": 11}]
+                       + columns[q_idx + 1:])
+        self._write_header(ws, columns, st)
+        ws.sheet_properties.outlinePr = Outline(summaryBelow=False, summaryRight=True)
+
+        name_col = next((i for i, c in enumerate(columns, 1) if c.get("key") == "name"), 1)
+        section_font = Font(bold=True, italic=True)
+        root_font = Font(bold=True)
+        row = 2
+        max_level = 0
+        asm_rows = []
+        for kind, obj, depth, qty, total, position in self._tree_rows():
+            level = min(max(depth - 1, 0), 7)
+            if kind == "section":
+                cell = ws.cell(row=row, column=name_col, value=obj)
+                cell.font = section_font
+                for col_idx in range(1, len(columns) + 1):
+                    ws.cell(row=row, column=col_idx).border = st["border"]
+            else:
+                data = self._row_data(obj, qty, position)
+                data["total_qty"] = total if depth > 0 else ""
+                if data["total_mass"] != "" and isinstance(total, (int, float)):
+                    data["total_mass"] = round(((obj.get("mass", 0) or 0) / 1000) * total, 6)
+                is_asm = obj.get("is_assembly", False)
+                self._write_row(ws, row, columns, data, st,
+                                fill=st["assembly_fill"] if is_asm else None,
+                                font=root_font if depth == 0 else None)
+                if is_asm and depth > 0:
+                    asm_rows.append((row, level))
+            if level:
+                ws.row_dimensions[row].outline_level = level
+                ws.row_dimensions[row].hidden = True
+                max_level = max(max_level, level)
+            row += 1
+        # Свернутые группы: кнопка "+" на строке подсборки
+        for r, level in asm_rows:
+            nxt = ws.row_dimensions[r + 1] if r + 1 < row else None
+            if nxt is not None and (nxt.outline_level or 0) > level:
+                ws.row_dimensions[r].collapsed = True
+        if max_level:
+            ws.sheet_format.outlineLevelRow = max_level
+
+    def _write_summary_sheet(self, ws, columns, st):
+        """Сводная: каждая деталь и сборка один раз, с общим количеством."""
+        fills = {}
+        cost_by_marking = {}
+        if getattr(self, "cost_data", None):
             cost_cols = [
                 {"key": "material_cost", "header": "Стоимость\nмат., руб", "width": 15},
                 {"key": "labor_cost", "header": "Стоимость\nработ, руб", "width": 15},
                 {"key": "total_cost", "header": "Итого, руб", "width": 15},
             ]
-            for i, cc in enumerate(cost_cols):
-                col_idx = len(columns) + i + 1
-                cell = ws.cell(row=1, column=col_idx)
-                cell.value = cc["header"]
-                cell.font = header_font
-                cell.fill = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")
-                cell.alignment = center
-                cell.border = border
-                col_letter = chr(64 + col_idx) if col_idx <= 26 else chr(64 + (col_idx - 1) // 26) + chr(65 + (col_idx - 1) % 26)
-                ws.column_dimensions[col_letter].width = cc["width"]
+            red = PatternFill(start_color="8B0000", end_color="8B0000", fill_type="solid")
+            fills = {c["key"]: red for c in cost_cols}
             columns = columns + cost_cols
-
-        ws.row_dimensions[1].height = 35
-
-        grouped_data = self._grouped_data()
+            cost_by_marking = {c["marking"]: c for c in self.cost_data}
+        self._write_header(ws, columns, st, fills)
 
         row = 2
-        cost_by_marking = {}
-        if hasattr(self, 'cost_data') and self.cost_data:
-            cost_by_marking = {c["marking"]: c for c in self.cost_data}
-
-        for item in grouped_data:
+        for item in self._grouped_data():
             marking = item.get("marking", "")
             pos_info = self.all_positions.get(marking, {})
-            mass_kg = (item.get("mass", 0) or 0) / 1000
-            is_asm = item.get("is_assembly", False)
-
-            material = item.get("material", "")
-            if is_asm and is_default_material(material):
-                material = ""
-
-            row_data = {
-                "position": pos_info.get("position", ""),
-                "marking": marking,
-                "name": item.get("name", ""),
-                "quantity": item.get("quantity", 1),
-                "mass_kg": round(mass_kg, 6) if mass_kg > 0 else "",
-                "total_mass": round(mass_kg * item.get("quantity", 1), 6) if mass_kg > 0 else "",
-                "material": material,
-                "stock_length": item.get("stock_length", ""),
-                "bending": "X" if item.get("is_bending") else "",
-                "level": item.get("level", 0) + 1 if item.get("level", 0) > 0 else "",
-                "is_assembly": is_asm,
-            }
-
+            data = self._row_data(item, item.get("quantity", 1), pos_info.get("position", ""))
             if marking in cost_by_marking:
                 c = cost_by_marking[marking]
-                row_data["material_cost"] = c["material_cost"]
-                row_data["labor_cost"] = c["labor_cost"]
-                row_data["total_cost"] = c["total_cost"]
-
-            for col_idx, col_def in enumerate(columns, 1):
-                cell = ws.cell(row=row, column=col_idx)
-                cell.value = row_data.get(col_def.get("key", ""), "")
-                cell.border = border
-                cell.alignment = left if col_def.get("key") in ("name", "material") else center
-                if is_asm:
-                    cell.fill = assembly_fill
-
-            if is_asm and item.get("level", 0) > 0:
-                ws.row_dimensions[row].outline_level = min(item["level"], 8)
-
+                data["material_cost"] = c["material_cost"]
+                data["labor_cost"] = c["labor_cost"]
+                data["total_cost"] = c["total_cost"]
+            self._write_row(ws, row, columns, data, st,
+                            fill=st["assembly_fill"] if item.get("is_assembly") else None)
             row += 1
-
         row += 1
 
-        if hasattr(self, 'cost_summary') and self.cost_summary:
+        if getattr(self, "cost_summary", None):
             cost_start = len(columns) - 2
             ws.cell(row=row, column=cost_start, value="Материалы:").font = Font(bold=True)
             ws.cell(row=row, column=cost_start + 1, value=self.cost_summary["total_material"]).font = Font(bold=True)
@@ -842,11 +1001,19 @@ class KompasExportFinal:
             ws.cell(row=row, column=cost_start, value="ИТОГО:").font = Font(bold=True, color="8B0000")
             ws.cell(row=row, column=cost_start + 1, value=self.cost_summary["total"]).font = Font(bold=True, color="8B0000")
 
-        for r in range(2, row):
-            cell_a = ws.cell(row=r, column=1)
-            if cell_a.value and isinstance(cell_a.value, int) and cell_a.value > 1:
-                ws.row_dimensions[r].outline_level = min(cell_a.value - 1, 8)
-                ws.row_dimensions[r].hidden = False
+    def generate_excel(self):
+        """Генерация Excel по шаблону: лист по сборкам (с группировкой) и сводная."""
+        print("\nСоздание Excel файла...")
+
+        wb = Workbook()
+        st = self._excel_styles()
+        columns = self._excel_columns()
+
+        tree_ws = wb.active
+        tree_ws.title = "По сборкам"
+        if self.all_data:
+            self._write_tree_sheet(tree_ws, columns, st)
+        self._write_summary_sheet(wb.create_sheet("Сводная"), columns, st)
 
         base_name = os.path.splitext(self.assembly_name)[0]
         output_path = os.path.join(self.assembly_dir, f"{base_name}_сводная_ведомость.xlsx")
